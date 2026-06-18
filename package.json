@@ -1,0 +1,12 @@
+{
+  "name": "mood-to-music-curator",
+  "version": "1.0.0",
+  "description": "Premium Spotify-style single page web application powered by Gemini AI",
+  "scripts": {
+    "dev": "python server.py"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "http-server": "^14.1.1"
+  }
+}
