@@ -1,168 +1,329 @@
-/* Custom Styles and Animations for Mood-to-Music Curator */
+/* =========================================================
+   Tarang — Premium Glassmorphic Design System
+   Award-winning, fluid, fully responsive CSS
+   ========================================================= */
 
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&display=swap');
 
+/* ---- Custom Properties ---- */
 :root {
   --font-display: 'Outfit', sans-serif;
   --font-sans: 'Plus Jakarta Sans', sans-serif;
-  
-  /* Fluid Sizing System - automatically scales down with window width */
-  --fluid-padding: clamp(1rem, 3.5vw, 2.5rem);
-  --fluid-margin: clamp(1.5rem, 4.5vw, 3.5rem);
-  --fluid-gap: clamp(0.75rem, 2.2vw, 1.75rem);
-  --fluid-radius: clamp(1rem, 1.8vw, 1.5rem);
-  
-  /* Fluid Typography */
-  --font-hero: clamp(2rem, 5.5vw, 4.25rem);
-  --font-title: clamp(1.35rem, 3.2vw, 2.25rem);
-  --font-card-title: clamp(1rem, 2vw, 1.25rem);
-  --font-body: clamp(0.8rem, 1.3vw, 0.95rem);
-  --font-small: clamp(0.68rem, 1.1vw, 0.8rem);
+
+  /* Fluid padding (sides of the page) */
+  --fluid-padding: clamp(0.9rem, 4vw, 3rem);
+
+  /* Fluid gap between grid cards */
+  --fluid-gap: clamp(0.65rem, 1.6vw, 1.5rem);
+
+  /* Fluid border radius for big panels */
+  --fluid-radius: clamp(0.85rem, 1.4vw, 1.6rem);
+
+  /* Fluid Typography Scale */
+  --font-hero:       clamp(2rem, 5.5vw, 4.25rem);
+  --font-title:      clamp(1.35rem, 3vw, 2.2rem);
+  --font-card-title: clamp(0.9rem, 1.5vw, 1.1rem);
+  --font-body:       clamp(0.8rem, 1.15vw, 0.95rem);
+  --font-small:      clamp(0.65rem, 0.9vw, 0.8rem);
+
+  /* Color System */
+  --color-bg:             #06050b;
+  --color-surface:        rgba(14, 10, 28, 0.55);
+  --color-border:         rgba(255, 255, 255, 0.06);
+  --color-border-purple:  rgba(168, 85, 247, 0.22);
+  --color-purple:         #a855f7;
+  --color-indigo:         #6366f1;
+  --color-rose:           #f43f5e;
+}
+
+/* ---- Reset & Base ---- */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  scroll-behavior: smooth;
 }
 
 body {
   font-family: var(--font-sans);
-  background: radial-gradient(circle at 50% 0%, #1e1145 0%, #070912 60%, #020108 100%);
-  min-height: 100vh;
+  background-color: var(--color-bg);
+  background-image:
+    radial-gradient(ellipse 80% 50% at 50% -15%, rgba(90, 30, 200, 0.15) 0%, transparent 70%),
+    radial-gradient(circle at 100% 90%, rgba(100, 50, 200, 0.06) 0%, transparent 50%);
   color: #e2e8f0;
+  line-height: 1.65;
   overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
-h1, h2, h3, .font-display {
+h1, h2, h3, h4, h5, h6,
+.font-display {
   font-family: var(--font-display);
+  letter-spacing: -0.025em;
 }
 
-/* Fluid Layout Helpers */
-.fluid-p { padding: var(--fluid-padding); }
-.fluid-py { padding-top: var(--fluid-padding); padding-bottom: var(--fluid-padding); }
-.fluid-px { padding-left: var(--fluid-padding); padding-right: var(--fluid-padding); }
-.fluid-m { margin: var(--fluid-margin); }
-.fluid-my { margin-top: var(--fluid-margin); margin-bottom: var(--fluid-margin); }
-.fluid-gap { gap: var(--fluid-gap); }
+/* ---- Fluid Utilities ---- */
+.fluid-px {
+  padding-left:  var(--fluid-padding);
+  padding-right: var(--fluid-padding);
+}
 .fluid-rounded { border-radius: var(--fluid-radius); }
 
-/* Premium Glassmorphism styling */
+/* ---- Glass Layers ---- */
 .glass {
-  background: rgba(10, 14, 26, 0.45);
-  backdrop-filter: blur(24px) saturate(160%);
-  -webkit-backdrop-filter: blur(24px) saturate(160%);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(14, 10, 28, 0.40);
+  backdrop-filter: blur(20px) saturate(160%);
+  -webkit-backdrop-filter: blur(20px) saturate(160%);
+  border: 1px solid var(--color-border);
 }
 
 .glass-premium {
-  background: linear-gradient(135deg, rgba(22, 16, 48, 0.4) 0%, rgba(10, 14, 26, 0.55) 100%);
-  backdrop-filter: blur(32px) saturate(180%);
-  -webkit-backdrop-filter: blur(32px) saturate(180%);
-  border: 1px solid rgba(168, 85, 247, 0.16);
-  box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.45), inset 0 1px 1px 0 rgba(255, 255, 255, 0.05);
+  background: linear-gradient(
+    145deg,
+    rgba(22, 14, 50, 0.50) 0%,
+    rgba(7, 5, 18, 0.72) 100%
+  );
+  backdrop-filter: blur(40px) saturate(200%);
+  -webkit-backdrop-filter: blur(40px) saturate(200%);
+  border: 1px solid var(--color-border-purple);
+  box-shadow:
+    0 24px 60px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06),
+    0 0 50px -12px rgba(168, 85, 247, 0.08);
 }
 
+/* Song Cards */
 .glass-card {
-  background: rgba(16, 20, 36, 0.3);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.04);
-  transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1);
-  transform-style: preserve-3d;
-  perspective: 1000px;
+  background: linear-gradient(
+    145deg,
+    rgba(28, 18, 58, 0.28) 0%,
+    rgba(10, 7, 22, 0.42) 100%
+  );
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+  border: 1px solid rgba(255, 255, 255, 0.045);
+  border-radius: var(--fluid-radius);
+  transition:
+    transform 0.55s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.4s ease,
+    box-shadow 0.55s cubic-bezier(0.16, 1, 0.3, 1),
+    background 0.4s ease;
+  box-shadow:
+    0 6px 28px rgba(0, 0, 0, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
 }
 
 .glass-card:hover {
-  background: rgba(26, 32, 58, 0.5);
-  border-color: rgba(168, 85, 247, 0.35);
-  box-shadow: 0 20px 40px -15px rgba(168, 85, 247, 0.25), 0 0 15px 1px rgba(168, 85, 247, 0.1);
+  background: linear-gradient(
+    145deg,
+    rgba(40, 24, 80, 0.48) 0%,
+    rgba(15, 10, 35, 0.60) 100%
+  );
+  border-color: rgba(168, 85, 247, 0.38);
+  box-shadow:
+    0 20px 48px -10px rgba(168, 85, 247, 0.28),
+    0 0 18px rgba(168, 85, 247, 0.08),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
   transform: translateY(-6px) scale(1.015);
 }
 
-/* Glow background blobs */
+/* Textarea / Input */
+.glass-input {
+  font-family: var(--font-sans);
+  background: rgba(4, 3, 10, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  box-shadow: inset 0 2px 6px rgba(0, 0, 0, 0.7);
+  transition: all 0.35s cubic-bezier(0.16, 1, 0.3, 1);
+  outline: none;
+  caret-color: var(--color-purple);
+}
+
+.glass-input:focus {
+  background: rgba(4, 3, 10, 0.88);
+  border-color: rgba(168, 85, 247, 0.55);
+  box-shadow:
+    0 0 0 3px rgba(168, 85, 247, 0.10),
+    0 0 28px rgba(168, 85, 247, 0.12),
+    inset 0 2px 6px rgba(0, 0, 0, 0.85);
+}
+
+/* ---- Ambient Background Blobs ---- */
 .ambient-blob {
   position: absolute;
   border-radius: 50%;
   pointer-events: none;
-  filter: blur(140px);
-  opacity: 0.1;
+  filter: blur(150px);
+  opacity: 0.2;
   z-index: 0;
-  transition: all 1s ease-in-out;
+  transition: all 2s ease;
 }
 
-/* Custom interactive inputs */
-.glass-input {
-  background: rgba(8, 8, 14, 0.55);
-  border: 1px solid rgba(255, 255, 255, 0.06);
-  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+/* ---- Song Grid ---- */
+.fluid-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 21vw, 310px), 1fr));
+  gap: var(--fluid-gap);
+  width: 100%;
 }
 
-.glass-input:focus {
-  background: rgba(8, 8, 14, 0.8);
-  border-color: rgba(168, 85, 247, 0.45);
-  box-shadow: 0 0 20px 0 rgba(168, 85, 247, 0.15), inset 0 1px 1px 0 rgba(0,0,0,0.8);
-  outline: none;
-}
-
-/* Animations */
+/* ---- Animations ---- */
 @keyframes float {
   0%, 100% { transform: translateY(0px) rotate(0deg); }
-  50% { transform: translateY(-12px) rotate(1.5deg); }
+  50%       { transform: translateY(-18px) rotate(1.5deg); }
+}
+@keyframes float-b {
+  0%, 100% { transform: translateY(-8px) rotate(-1deg); }
+  50%       { transform: translateY(10px) rotate(1deg); }
 }
 
-@keyframes glow {
-  0%, 100% { box-shadow: 0 0 12px 1px rgba(168, 85, 247, 0.15); }
-  50% { box-shadow: 0 0 25px 5px rgba(168, 85, 247, 0.35); }
+.animate-float-slow    { animation: float   12s ease-in-out infinite; }
+.animate-float-delayed { animation: float-b 14s ease-in-out infinite 3s; }
+
+@keyframes shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position:  200% 0; }
 }
 
-@keyframes pulse-dot {
-  0%, 100% { transform: scale(1); opacity: 1; }
-  50% { transform: scale(1.25); opacity: 0.5; }
-}
-
-.animate-float-slow {
-  animation: float 8s ease-in-out infinite;
-}
-
-.animate-float-delayed {
-  animation: float 8s ease-in-out infinite;
-  animation-delay: 4s;
-}
-
-.glow-active:focus-within {
-  animation: glow 3s ease-in-out infinite;
-}
-
-.pulse-active {
-  animation: pulse-dot 2s ease-in-out infinite;
-}
-
-/* Webkit Scrollbar */
-::-webkit-scrollbar {
-  width: 6px;
-  height: 6px;
-}
-::-webkit-scrollbar-track {
-  background: rgba(13, 17, 30, 0.2);
-}
-::-webkit-scrollbar-thumb {
-  background: rgba(168, 85, 247, 0.2);
-  border-radius: 99px;
-}
-::-webkit-scrollbar-thumb:hover {
-  background: rgba(168, 85, 247, 0.45);
-}
-
-/* Custom shimmer animations */
 .shimmer-bg {
-  background: linear-gradient(90deg, rgba(16, 20, 36, 0.3) 25%, rgba(45, 35, 75, 0.4) 50%, rgba(16, 20, 36, 0.3) 75%);
+  background: linear-gradient(
+    90deg,
+    rgba(20, 16, 40, 0.40) 25%,
+    rgba(50, 32, 85, 0.50) 50%,
+    rgba(20, 16, 40, 0.40) 75%
+  );
   background-size: 200% 100%;
   animation: shimmer 1.8s infinite linear;
 }
 
-@keyframes shimmer {
-  0% { background-position: -200% 0; }
-  100% { background-position: 200% 0; }
+/* ---- Vinyl Ring spin ---- */
+@keyframes spin-vinyl {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.vinyl-active {
+  animation: spin-vinyl 12s linear infinite;
+  border-radius: 50% !important;
 }
 
-/* Fluid Responsive Grid */
-.fluid-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(clamp(240px, 22vw, 300px), 1fr));
-  gap: var(--fluid-gap);
+/* ---- Siri-Style mic pulse ---- */
+@keyframes siripulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(168, 85, 247, 0.65),
+                0 0 0 0 rgba(168, 85, 247, 0.35);
+  }
+  55% {
+    box-shadow: 0 0 0 10px rgba(168, 85, 247, 0),
+                0 0 0 20px rgba(168, 85, 247, 0);
+  }
+}
+.siri-pulse-active {
+  animation: siripulse 1.6s ease-in-out infinite;
+}
+
+/* ---- Text Gradients ---- */
+.text-gradient {
+  background: linear-gradient(130deg, #e9d5ff 0%, #c084fc 45%, #818cf8 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+.text-gradient-rose {
+  background: linear-gradient(130deg, #fda4af 0%, #f43f5e 50%, #d946ef 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ---- Custom Scrollbar ---- */
+::-webkit-scrollbar       { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: rgba(6, 5, 11, 0.4); }
+::-webkit-scrollbar-thumb {
+  background: rgba(168, 85, 247, 0.30);
+  border-radius: 99px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(168, 85, 247, 0.55); }
+
+/* ---- Dynamic Mood Themes ---- */
+body[data-theme='cozy'] {
+  background-image: radial-gradient(ellipse 80% 50% at 50% -15%, rgba(180, 30, 30, 0.14) 0%, transparent 70%);
+}
+body[data-theme='happy'] {
+  background-image: radial-gradient(ellipse 80% 50% at 50% -15%, rgba(200, 120, 10, 0.14) 0%, transparent 70%);
+}
+body[data-theme='sad'] {
+  background-image: radial-gradient(ellipse 80% 50% at 50% -15%, rgba(30, 80, 200, 0.14) 0%, transparent 70%);
+}
+body[data-theme='hype'] {
+  background-image: radial-gradient(ellipse 80% 50% at 50% -15%, rgba(236, 30, 120, 0.14) 0%, transparent 70%);
+}
+body[data-theme='focus'] {
+  background-image: radial-gradient(ellipse 80% 50% at 50% -15%, rgba(10, 160, 100, 0.14) 0%, transparent 70%);
+}
+body[data-theme='chill'] {
+  background-image: radial-gradient(ellipse 80% 50% at 50% -15%, rgba(90, 30, 200, 0.14) 0%, transparent 70%);
+}
+
+/* ---- Tarang Voice Widget ---- */
+#tarang-widget {
+  transition:
+    transform 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 0.5s cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 0.4s ease;
+  box-shadow:
+    0 12px 32px rgba(0, 0, 0, 0.45),
+    0 0 22px -4px rgba(168, 85, 247, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+
+#tarang-widget:hover {
+  transform: translateX(-50%) translateY(-4px);
+  border-color: rgba(168, 85, 247, 0.40) !important;
+  box-shadow:
+    0 20px 45px rgba(168, 85, 247, 0.22),
+    0 0 28px -6px rgba(168, 85, 247, 0.18),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+/* Waveform canvas blend */
+#tarang-wave-canvas { mix-blend-mode: screen; }
+
+/* ---- Tarang Widget Disabled State ---- */
+#tarang-widget.disabled {
+  opacity: 0.55;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+#tarang-widget.disabled:hover {
+  transform: translateX(-50%) translateY(0); /* no lift on hover when disabled */
+  border-color: rgba(255, 255, 255, 0.08) !important;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+#tarang-widget.disabled #tarang-mic-container {
+  background: rgba(255, 255, 255, 0.03) !important;
+  border-color: rgba(255, 255, 255, 0.05) !important;
+  cursor: not-allowed;
+}
+#tarang-widget.disabled #tarang-mic-icon {
+  color: rgba(255, 255, 255, 0.2) !important;
+}
+#tarang-widget.disabled #tarang-state-dot {
+  bg-color: #3f3f46; /* grey dot */
+  background-color: #3f3f46 !important;
+}
+
+/* ---- Modal Open State ---- */
+#settings-modal.open {
+  display: flex;
+}
+
+/* ---- Utility: hide on mobile but show on sm+ ---- */
+@media (max-width: 640px) {
+  .fluid-grid {
+    grid-template-columns: repeat(auto-fill, minmax(clamp(200px, 80vw, 280px), 1fr));
+  }
 }

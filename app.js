@@ -156,95 +156,132 @@ function curateFallback(vibe) {
   }
 
   // Pick fallback songs from selected category
-  const list = fallbackDatabase[category];
+  const list = fallbackDatabase[category] || fallbackDatabase.chill;
   const shuffled = [...list].sort(() => 0.5 - Math.random());
-  return shuffled;
-}
-
-// REST call to a single model
-async function makeGeminiRequest(model, version, vibe, apiKey) {
-  // Requesting exactly 20 songs to filter out any potentially restricted video links
-  const prompt = `You are a world-class music curator specializing in Indian music. Analyze the user's emotional state and situational context described below, and curate EXACTLY 20 real songs that capture this mood.
   
-  IMPORTANT CONSTRAINT: The songs curated MUST be strictly in the Hindi language (e.g. from Bollywood, Hindi indie, or Hindi classical/pop). Do not recommend songs in English or any other language under any circumstances. Ensure the song titles and artists are real and correspond to Hindi songs.
-
-User vibe description: "${vibe}"
-
-Your output must be a valid JSON array of objects. Do NOT include markdown styling or outer tags. Ensure exactly 20 items are returned.
-Each object must have the following schema:
-{
-  "title": "Song Title (in Hindi/English transliteration, e.g. 'Kabira' or 'Tum Se Hi')",
-  "artist": "Artist Name (e.g. 'Arijit Singh')",
-  "explanation": "A short, poetic, and atmospheric explanation in English of exactly why this song matches their vibe, limited to 1-2 sentences."
-}
-
-JSON output:`;
-
-  const response = await fetch(`https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${apiKey}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      contents: [{
-        parts: [{ text: prompt }]
-      }],
-      generationConfig: {
-        responseMimeType: 'application/json'
+  // Ensure we have exactly 20 songs by backfilling from other categories if necessary
+  if (shuffled.length < 20) {
+    const allFallbackCategories = Object.keys(fallbackDatabase);
+    for (const cat of allFallbackCategories) {
+      if (shuffled.length >= 20) break;
+      if (cat === category) continue;
+      const extraSongs = fallbackDatabase[cat];
+      const shuffledExtra = [...extraSongs].sort(() => 0.5 - Math.random());
+      for (const song of shuffledExtra) {
+        if (shuffled.length >= 20) break;
+        if (!shuffled.some(s => s.title === song.title)) {
+          shuffled.push(song);
+        }
       }
-    })
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-    const message = errorData.error?.message || `HTTP ${response.status}`;
-    throw new Error(message);
+    }
   }
-
-  const data = await response.json();
-  const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
   
-  if (!text) {
-    throw new Error("Empty response from AI engine.");
-  }
-
-  const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-  const parsed = JSON.parse(cleanText);
-  if (Array.isArray(parsed) && parsed.length > 0) {
-    return parsed.slice(0, 20);
-  }
-  throw new Error("AI returned data in an unexpected format.");
+  return shuffled.slice(0, 20);
 }
 
-// Call Gemini API client-side with a model retry loop to solve model deprecations/permissions
-async function curateWithGemini(vibe, apiKey) {
-  const modelsToTry = [
+// REST call to a single Gemini model with AbortController timeout
+async function makeGeminiRequest(model, version, vibe, apiKey, excludedSongs = [], timeoutMs = 15000) {
+  let exclusionPrompt = '';
+  if (excludedSongs && excludedSongs.length > 0) {
+    exclusionPrompt = `\n- DO NOT include any of the following songs: ${excludedSongs.slice(0, 55).join(', ')}.`;
+  }
+
+  const prompt = `You are a world-class music curator specializing in Indian music. Analyze the user's emotional state described below, and curate EXACTLY 25 real Hindi songs that match this mood.
+
+CONSTRAINTS:
+- Songs MUST be in Hindi (Bollywood, Hindi indie, or Hindi pop/classical). No English songs.
+- Song titles and artists must be real and well-known.${exclusionPrompt}
+- Return EXACTLY 25 items. Variety is important — mix eras, tempos, and artists.
+
+User mood: "${vibe}"
+
+Output a JSON array. No markdown, no wrapping. Each object:
+{"title":"Song Title","artist":"Artist Name","explanation":"1-sentence poetic reason why this matches."}
+
+JSON array:`;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json' }
+        })
+      }
+    );
+
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({}));
+      throw new Error(errorData.error?.message || `HTTP ${response.status}`);
+    }
+
+    const data = await response.json();
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!text) throw new Error("Empty response from AI engine.");
+
+    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
+    const parsed = JSON.parse(cleanText);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return parsed.slice(0, 25);
+    }
+    throw new Error("AI returned data in an unexpected format.");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Optimized Gemini caller — races top 2 models in parallel for speed
+async function curateWithGemini(vibe, apiKey, excludedSongs = []) {
+  // Race the two fastest models simultaneously
+  const fastModels = [
     { name: 'gemini-2.5-flash', version: 'v1beta' },
-    { name: 'gemini-2.0-flash', version: 'v1beta' },
+    { name: 'gemini-2.0-flash', version: 'v1beta' }
+  ];
+
+  // Fallback models if both fast ones fail
+  const fallbackModels = [
+    { name: 'gemini-2.0-flash-lite', version: 'v1beta' },
     { name: 'gemini-1.5-flash', version: 'v1' },
     { name: 'gemini-1.5-flash', version: 'v1beta' },
-    { name: 'gemini-1.5-pro', version: 'v1' },
-    { name: 'gemini-1.5-pro', version: 'v1beta' },
     { name: 'gemini-pro', version: 'v1beta' }
   ];
-  let lastError = null;
 
-  for (const item of modelsToTry) {
+  // Phase 1: Race fast models (whoever responds first wins)
+  try {
+    console.log('Racing fast models:', fastModels.map(m => m.name).join(' vs '));
+    const songs = await Promise.any(
+      fastModels.map(m => makeGeminiRequest(m.name, m.version, vibe, apiKey, excludedSongs, 12000))
+    );
+    console.log(`Fast model race won with ${songs.length} songs`);
+    return songs;
+  } catch (raceErr) {
+    console.warn('Fast model race failed, trying fallback models sequentially:', raceErr);
+  }
+
+  // Phase 2: Sequential fallback
+  let lastError = null;
+  for (const item of fallbackModels) {
     try {
-      console.log(`Attempting curation with model: ${item.name} (${item.version})`);
-      const songs = await makeGeminiRequest(item.name, item.version, vibe, apiKey);
-      console.log(`Curation successful with model: ${item.name} (${item.version})`);
+      console.log(`Fallback: trying ${item.name} (${item.version})`);
+      const songs = await makeGeminiRequest(item.name, item.version, vibe, apiKey, excludedSongs);
       return songs;
     } catch (err) {
-      console.warn(`Model ${item.name} (${item.version}) request failed:`, err);
       lastError = err;
-      if (err.message && (err.message.includes("API key not valid") || err.message.includes("API_KEY_INVALID"))) {
+      if (err.message?.includes("API key not valid") || err.message?.includes("API_KEY_INVALID")) {
         throw err;
       }
     }
   }
-  throw new Error(`All Gemini models failed. Last error details: ${lastError?.message || lastError}`);
+  throw new Error(`All Gemini models failed. Last error: ${lastError?.message || lastError}`);
 }
+
 
 // Verification Log Terminal Writer Helper
 function writeConsoleLog(message, type = 'info') {
@@ -288,14 +325,19 @@ function renderSkeleton() {
 
   for (let i = 0; i < 10; i++) {
     const skeleton = document.createElement('div');
-    skeleton.className = 'glass-card fluid-rounded fluid-p flex flex-col items-center text-center select-none h-full';
+    skeleton.className = 'glass-card fluid-rounded p-5 flex flex-col select-none h-full';
     skeleton.innerHTML = `
-      <div class="w-[clamp(100px,30vw,136px)] h-[clamp(100px,30vw,136px)] rounded-2xl shimmer-bg mb-4"></div>
-      <div class="h-6 w-3/4 shimmer-bg rounded-md mb-2"></div>
-      <div class="h-4 w-1/2 shimmer-bg rounded-md mb-6"></div>
-      <div class="h-3 w-full shimmer-bg rounded-md mb-2"></div>
-      <div class="h-3 w-5/6 shimmer-bg rounded-md mb-4"></div>
-      <div class="h-10 w-full shimmer-bg rounded-xl mt-auto"></div>
+      <div class="flex items-center gap-3.5 mb-4">
+        <div class="w-[clamp(52px,9vw,68px)] h-[clamp(52px,9vw,68px)] rounded-xl shimmer-bg flex-shrink-0"></div>
+        <div class="flex-grow space-y-2">
+          <div class="h-3 w-1/2 shimmer-bg rounded-md"></div>
+          <div class="h-5 w-3/4 shimmer-bg rounded-md"></div>
+          <div class="h-3 w-2/5 shimmer-bg rounded-md"></div>
+        </div>
+      </div>
+      <div class="h-3 w-full shimmer-bg rounded-md mb-2 flex-grow"></div>
+      <div class="h-3 w-4/5 shimmer-bg rounded-md mb-4"></div>
+      <div class="h-9 w-full shimmer-bg rounded-xl mt-auto"></div>
     `;
     resultsContainer.appendChild(skeleton);
   }
@@ -467,6 +509,7 @@ function renderSongs(songs, source) {
   
   const resultsContainer = document.getElementById('results-container');
   resultsContainer.innerHTML = '';
+  resultsContainer.classList.remove('hidden');
   
   const alertContainer = document.getElementById('api-alert');
   if (source === 'mock') {
@@ -503,52 +546,52 @@ function renderSongs(songs, source) {
   // Render final working cards
   songs.forEach((song, idx) => {
     const card = document.createElement('div');
-    card.className = `glass-card fluid-rounded fluid-p flex flex-col items-center text-center animate-fade-in-up opacity-0 relative select-none h-full`;
-    card.style.animationDelay = `${idx * 0.08}s`;
+    card.className = `glass-card fluid-rounded p-5 flex flex-col animate-fade-in-up opacity-0 relative select-none h-full group`;
+    card.style.animationDelay = `${idx * 0.06}s`;
     
     const gradient = getDynamicGradient(song.title, song.artist);
     const youtubeUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(song.title + ' ' + song.artist + ' song')}`;
 
     card.innerHTML = `
-      <div class="relative w-[clamp(100px,30vw,136px)] h-[clamp(100px,30vw,136px)] rounded-2xl mb-4 shadow-lg flex items-center justify-center group overflow-hidden" style="background: ${gradient}">
-        <!-- Floating play overlay on hover -->
-        <div onclick="playSongAtIndex(${idx})" class="absolute inset-0 bg-black/45 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex items-center justify-center cursor-pointer">
-          <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-white transform scale-90 group-hover:scale-100 transition-transform duration-300" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
+      <!-- Card Header: Art + Number Badge -->
+      <div class="flex items-center gap-3.5 mb-4">
+        <div class="relative flex-shrink-0">
+          <div onclick="playSongAtIndex(${idx})" class="w-[clamp(52px,9vw,68px)] h-[clamp(52px,9vw,68px)] rounded-xl shadow-lg flex items-center justify-center cursor-pointer overflow-hidden transition-all duration-500 group-hover:scale-105" style="background: ${gradient}">
+            <div class="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-all duration-300 flex items-center justify-center rounded-xl">
+              <svg class="h-7 w-7 text-white opacity-0 group-hover:opacity-100 transition-opacity duration-300 drop-shadow" fill="currentColor" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+            </div>
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-7 w-7 text-white/80 drop-shadow" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"/>
+            </svg>
+          </div>
+          <!-- Track number badge -->
+          <div class="absolute -top-1.5 -left-1.5 w-5 h-5 rounded-full bg-purple-500 border-2 border-[#06050b] flex items-center justify-center song-num">
+            <span class="text-white font-bold" style="font-size:0.55rem">${idx + 1}</span>
+          </div>
         </div>
-        <!-- Note Icon -->
-        <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-white/90 drop-shadow-md" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3" />
-        </svg>
+
+        <div class="min-w-0 flex-grow">
+          <!-- Verified badge -->
+          <div class="inline-flex items-center gap-1 mb-1 text-emerald-400 text-[0.6rem] font-semibold uppercase tracking-wider bg-emerald-950/30 border border-emerald-500/20 px-2 py-0.5 rounded-full">
+            <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+            Verified
+          </div>
+          <h3 class="font-display font-bold text-[var(--font-card-title)] text-white leading-tight line-clamp-1 cursor-pointer hover:text-purple-300 transition-colors" title="${song.title}" onclick="playSongAtIndex(${idx})">${song.title}</h3>
+          <p class="text-purple-300/80 text-[var(--font-small)] line-clamp-1 leading-tight mt-0.5">${song.artist}</p>
+        </div>
       </div>
-      
-      <!-- Verified Playability Badge -->
-      <div class="flex items-center gap-1 mb-2.5 text-emerald-400 text-[var(--font-small)] font-semibold uppercase tracking-wider select-none bg-emerald-950/35 border border-emerald-500/20 px-2.5 py-0.5 rounded-full">
-        <svg class="w-3 h-3" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
-        </svg>
-        <span>Verified Playable</span>
-      </div>
-      
-      <h3 class="font-display font-bold text-[var(--font-card-title)] text-white line-clamp-1 mb-1 cursor-pointer hover:text-red-400 transition-colors" title="${song.title}" onclick="playSongAtIndex(${idx})">${song.title}</h3>
-      <p class="text-purple-300 font-medium text-[var(--font-small)] mb-3 line-clamp-1">${song.artist}</p>
-      
-      <p class="text-gray-300 text-[var(--font-small)] leading-relaxed mb-5 italic">"${song.explanation}"</p>
-      
-      <div class="mt-auto flex flex-col gap-2 w-full">
-        <button onclick="playSongAtIndex(${idx})" class="w-full inline-flex items-center justify-center gap-1.5 bg-gradient-to-r from-red-500 to-rose-600 hover:from-red-600 hover:to-rose-700 text-white font-bold py-2 md:py-2.5 rounded-xl text-[var(--font-small)] uppercase tracking-wider transition-all shadow-md active:scale-[0.98] cursor-pointer">
-          <svg class="h-4 w-4 fill-current" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path d="M8 5v14l11-7z"/>
-          </svg>
-          Play Here
+
+      <!-- Explanation text -->
+      <p class="text-gray-400 text-[var(--font-small)] leading-relaxed italic line-clamp-2 flex-grow mb-4">"${song.explanation}"</p>
+
+      <!-- Action Buttons -->
+      <div class="flex gap-2 mt-auto">
+        <button onclick="playSongAtIndex(${idx})" class="flex-grow inline-flex items-center justify-center gap-1.5 bg-gradient-to-r from-rose-500 to-red-600 hover:from-rose-400 hover:to-red-500 text-white font-bold py-2.5 rounded-xl text-[var(--font-small)] uppercase tracking-wider transition-all shadow-md shadow-rose-500/15 hover:shadow-rose-500/30 active:scale-[0.98] cursor-pointer">
+          <svg class="h-3.5 w-3.5 fill-current flex-shrink-0" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+          Play
         </button>
-        <a href="${youtubeUrl}" target="_blank" class="w-full inline-flex items-center justify-center gap-1.5 glass hover:bg-white/5 text-gray-300 hover:text-white py-2 md:py-2.5 rounded-xl text-[var(--font-small)] uppercase tracking-wider transition-all cursor-pointer">
-          <svg class="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-            <path d="M23.498 6.163c-.272-1.022-1.074-1.826-2.099-2.099C19.558 3.5 12 3.5 12 3.5s-7.558 0-9.399.564C.776 4.337-.026 5.141-.298 6.163.224 8.007.224 12 .224 12s0 3.993.522 5.837c.272 1.022 1.074 1.826 2.099 2.099C4.442 20.5 12 20.5 12 20.5s7.558 0 9.399-.564c1.025-.273 1.827-1.077 2.099-2.099.522-1.844.522-5.837.522-5.837s0-3.993-.522-5.837zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
-          </svg>
-          Open YouTube
+        <a href="${youtubeUrl}" target="_blank" title="Open on YouTube" class="w-10 h-10 inline-flex items-center justify-center rounded-xl glass hover:bg-white/6 border border-white/8 hover:border-white/18 text-gray-400 hover:text-rose-400 transition-all cursor-pointer flex-shrink-0">
+          <svg class="w-4 h-4 fill-current" viewBox="0 0 24 24"><path d="M23.498 6.163c-.272-1.022-1.074-1.826-2.099-2.099C19.558 3.5 12 3.5 12 3.5s-7.558 0-9.399.564C.776 4.337-.026 5.141-.298 6.163.224 8.007.224 12 .224 12s0 3.993.522 5.837c.272 1.022 1.074 1.826 2.099 2.099C4.442 20.5 12 20.5 12 20.5s7.558 0 9.399-.564c1.025-.273 1.827-1.077 2.099-2.099.522-1.844.522-5.837.522-5.837s0-3.993-.522-5.837zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/></svg>
         </a>
       </div>
     `;
@@ -604,7 +647,7 @@ function renderHistoryChips() {
     chip.title = vibe;
     chip.addEventListener('click', () => {
       document.getElementById('mood-input').value = vibe;
-      handleCuration(vibe);
+  handleCuration(vibe);
     });
     container.appendChild(chip);
   });
@@ -621,9 +664,9 @@ async function handleCuration(vibe) {
   
   button.disabled = true;
   button.classList.add('opacity-85', 'cursor-not-allowed');
-  buttonText.textContent = 'Curating vibe...';
+  buttonText.textContent = 'Curating vibe…';
   buttonIcon.innerHTML = `
-    <svg class="animate-spin h-5 w-5 text-black" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+    <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
       <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
       <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
     </svg>
@@ -638,95 +681,162 @@ async function handleCuration(vibe) {
   if (consolePanel) consolePanel.classList.remove('hidden');
   if (consoleLogs) consoleLogs.innerHTML = '';
 
-  writeConsoleLog(`Initializing curation verification for vibe: "${vibe}"`, 'info');
+  writeConsoleLog(`Initializing curation for vibe: "${vibe}"`, 'info');
 
   try {
-    let songs;
+    const workingSongs = [];
+    const excludedSongs = [];
+    let attempts = 0;
+    const maxAttempts = 4;
     let source = 'gemini';
-    
+
     if (state.apiKey && state.apiKey.trim()) {
-      try {
-        writeConsoleLog("Connecting to Gemini AI model pool...", "info");
-        songs = await curateWithGemini(vibe, state.apiKey);
-        writeConsoleLog(`Received ${songs.length} song recommendations from Gemini.`, "pass");
-      } catch (err) {
-        console.warn("Gemini curation failed, falling back to local database:", err);
-        showToast(`Gemini API Error: ${err.message || err}. Using offline demo fallback.`, true);
-        writeConsoleLog(`Gemini API call failed (${err.message || err}). Falling back to local database.`, "warn");
-        songs = curateFallback(vibe);
-        source = 'mock';
+      writeConsoleLog("Starting Gemini multi-batch stream harvest…", "header");
+      
+      while (workingSongs.length < 20 && attempts < maxAttempts) {
+        attempts++;
+        writeConsoleLog(`Gemini Curation Attempt #${attempts} (Current Playable Count: ${workingSongs.length}/20)`, "info");
+        
+        let candidates = [];
+        try {
+          candidates = await curateWithGemini(vibe, state.apiKey, excludedSongs);
+          writeConsoleLog(`Received ${candidates.length} song recommendations from Gemini.`, "pass");
+        } catch (err) {
+          console.warn("Gemini curation failed:", err);
+          writeConsoleLog(`Gemini API call failed: ${err.message || err}`, "warn");
+          
+          if (workingSongs.length === 0) {
+            showToast(`Gemini API Error: ${err.message || err}. Using offline demo fallback.`, true);
+            writeConsoleLog("Falling back to local database.", "warn");
+            const fallbackSongs = curateFallback(vibe);
+            source = 'mock';
+            
+            // Verify fallback songs
+            const BATCH_SIZE = 5;
+            for (let i = 0; i < fallbackSongs.length; i += BATCH_SIZE) {
+              const batch = fallbackSongs.slice(i, i + BATCH_SIZE);
+              const batchPromises = batch.map(async (song) => {
+                try {
+                  const query = `${song.title} ${song.artist} song`;
+                  const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+                  if (response.ok) {
+                    const data = await response.json();
+                    if (data.videoId) {
+                      song.videoId = data.videoId;
+                      workingSongs.push(song);
+                    }
+                  }
+                } catch (e) {}
+              });
+              await Promise.all(batchPromises);
+            }
+          }
+          break; // break the while loop
+        }
+
+        // Add candidate titles to exclude list for next loop iterations
+        candidates.forEach(s => {
+          if (s.title) excludedSongs.push(s.title);
+        });
+
+        // Verify this batch
+        writeConsoleLog(`Verifying batch of ${candidates.length} songs…`, "info");
+        
+        const BATCH_SIZE = 5;
+        for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+          if (workingSongs.length >= 20) break;
+
+          const batch = candidates.slice(i, i + BATCH_SIZE);
+          const batchPromises = batch.map(async (song) => {
+            if (workingSongs.length >= 20) return;
+
+            const trackId = `"${song.title}"`;
+            try {
+              const query = `${song.title} ${song.artist} song`;
+              writeConsoleLog(`Checking: ${trackId} by ${song.artist}`, "info");
+              
+              const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+              if (response.ok) {
+                const data = await response.json();
+                if (data.candidates && data.candidates.length > 0) {
+                  data.candidates.forEach((cand, cIdx) => {
+                    const status = cand.ok 
+                      ? "PLAYABLE" 
+                      : `UNPLAYABLE (${cand.status}${cand.reason ? ': ' + cand.reason : ''})`;
+                    writeConsoleLog(`  [Cand ${cIdx+1}] ${cand.videoId} → ${status}`, cand.ok ? "pass" : "fail");
+                  });
+                }
+                if (data.videoId) {
+                  song.videoId = data.videoId;
+                  workingSongs.push(song);
+                  writeConsoleLog(`✓ [${workingSongs.length}/20] ${trackId} → ${data.videoId}`, "pass");
+                  buttonText.textContent = `Verified ${workingSongs.length} songs…`;
+                } else {
+                  song.videoId = null;
+                  writeConsoleLog(`✗ ${trackId} — no embeddable video found`, "fail");
+                }
+              } else {
+                song.videoId = null;
+                writeConsoleLog(`✗ ${trackId} — search API error`, "fail");
+              }
+            } catch (err) {
+              song.videoId = null;
+              writeConsoleLog(`✗ ${trackId} — network error: ${err.message}`, "fail");
+            }
+          });
+          await Promise.all(batchPromises);
+        }
+
+        if (workingSongs.length >= 20) {
+          writeConsoleLog("Collected target 20 verified playable songs!", "pass");
+          break;
+        }
       }
     } else {
-      writeConsoleLog("No API Key configured. Accessing local database...", "warn");
-      await new Promise(resolve => setTimeout(resolve, 800));
-      songs = curateFallback(vibe);
+      writeConsoleLog("No API Key configured. Accessing local database…", "warn");
+      await new Promise(resolve => setTimeout(resolve, 400));
+      const fallbackSongs = curateFallback(vibe);
       source = 'mock';
-      writeConsoleLog(`Loaded ${songs.length} candidate songs from local fallback database.`, "pass");
+      writeConsoleLog(`Loaded ${fallbackSongs.length} songs from local fallback database.`, "pass");
+      
+      // Verify mock songs
+      writeConsoleLog("Verifying fallback songs playability...", "info");
+      const BATCH_SIZE = 5;
+      for (let i = 0; i < fallbackSongs.length; i += BATCH_SIZE) {
+        const batch = fallbackSongs.slice(i, i + BATCH_SIZE);
+        const batchPromises = batch.map(async (song) => {
+          try {
+            const query = `${song.title} ${song.artist} song`;
+            const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+            if (response.ok) {
+              const data = await response.json();
+              if (data.videoId) {
+                song.videoId = data.videoId;
+                workingSongs.push(song);
+              }
+            }
+          } catch (e) {}
+        });
+        await Promise.all(batchPromises);
+      }
     }
 
-    // Update loader text to show stream verification status
-    buttonText.textContent = 'Verifying streams...';
-    writeConsoleLog("Starting playability checks on all tracks in parallel...", "header");
-    
-    // Resolve and verify YouTube video IDs for all curated songs in parallel
-    const resolvePromises = songs.map(async (song, idx) => {
-      const trackIdStr = `#${idx + 1} "${song.title}"`;
-      try {
-        const query = `${song.title} ${song.artist} song`;
-        writeConsoleLog(`Querying: ${trackIdStr} by ${song.artist}`, "info");
-        
-        const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
-        if (response.ok) {
-          const data = await response.json();
-          
-          // Print candidate test records in log
-          if (data.candidates && data.candidates.length > 0) {
-            data.candidates.forEach((cand, cIdx) => {
-              const statusText = cand.ok 
-                ? "PLAYABLE (Status: OK, Embed Allowed)" 
-                : `UNPLAYABLE (Status: ${cand.status}${cand.reason ? ', Reason: ' + cand.reason : ''})`;
-              const indicator = cand.ok ? "pass" : "fail";
-              writeConsoleLog(`  [Cand ${cIdx + 1}] ID ${cand.videoId} -> ${statusText}`, indicator);
-            });
-          }
-          
-          if (data.videoId) {
-            song.videoId = data.videoId;
-            writeConsoleLog(`PASSED: ${trackIdStr} matched to working video: youtube-nocookie.com/embed/${data.videoId}`, "pass");
-          } else {
-            song.videoId = null;
-            writeConsoleLog(`REJECTED: ${trackIdStr} could not resolve any embeddable video streams.`, "fail");
-          }
-        } else {
-          song.videoId = null;
-          writeConsoleLog(`FAILED: Search API error for ${trackIdStr}.`, "fail");
-        }
-      } catch (err) {
-        song.videoId = null;
-        writeConsoleLog(`ERROR: Network check failed for ${trackIdStr}: ${err.message}`, "fail");
-        console.warn(`Could not pre-resolve video stream for ${song.title}:`, err);
-      }
-    });
-    
-    await Promise.all(resolvePromises);
-    
-    // Filter out songs with no verified embeddable video streams
-    const workingSongs = songs.filter(s => s.videoId);
-    const finalSongs = workingSongs.slice(0, 10);
-    
+    // Limit active list to exactly 20 songs
+    const finalPlaylist = workingSongs.slice(0, 20);
+
     writeConsoleLog("Playability Validation Complete", "header");
-    writeConsoleLog(`Results: Checked ${songs.length} candidate songs -> ${workingSongs.length} verified playable -> ${songs.length - workingSongs.length} filtered out.`, "info");
-    
-    if (finalSongs.length === 0) {
-      writeConsoleLog("CRITICAL: Zero playable streams found. Suggestions list is empty.", "fail");
-      throw new Error("Could not resolve any verified working video streams for the curation. Please try another vibe.");
+    writeConsoleLog(`Results: Total ${finalPlaylist.length} verified playable songs presented.`, "info");
+
+    if (finalPlaylist.length === 0) {
+      writeConsoleLog("CRITICAL: Zero playable streams found.", "fail");
+      throw new Error("Could not resolve any working video streams. Please try another mood description.");
     }
+
+    renderSongs(finalPlaylist, source);
+    applyAmbientTheme(vibe);
     
-    writeConsoleLog(`Presenting top ${finalSongs.length} verified working tracks to the user.`, "pass");
-    renderSongs(finalSongs, source);
-    
-    // Auto Play random song immediately upon successful loading
-    writeConsoleLog("Curation complete. Auto Play enabled: launching a random track.", "info");
+    // Auto Play random song
+    writeConsoleLog("Curation complete. Launching a random track.", "info");
     playRandomSong();
   } catch (error) {
     console.error("Curation handler error:", error);
@@ -735,15 +845,14 @@ async function handleCuration(vibe) {
     state.curating = false;
     button.disabled = false;
     button.classList.remove('opacity-85', 'cursor-not-allowed');
-    buttonText.textContent = 'Curate My Mood';
+    buttonText.textContent = 'Curate Music';
     buttonIcon.innerHTML = `
-      <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 text-black transition-transform group-hover:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3" />
+      <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+        <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
       </svg>
     `;
   }
 }
-
 // Settings Modal Management
 function setupSettingsModal() {
   const modal = document.getElementById('settings-modal');
@@ -787,14 +896,16 @@ function setupSettingsModal() {
 
 function updateKeyBadge(key) {
   const badge = document.getElementById('api-status-badge');
+  if (!badge) return;
+  badge.classList.remove('hidden');
   if (key) {
-    badge.className = "inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[var(--font-small)] font-medium bg-emerald-950/50 border border-emerald-500/30 text-emerald-400";
+    badge.className = "sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[var(--font-small)] font-semibold bg-emerald-950/50 border border-emerald-500/25 text-emerald-300";
     badge.innerHTML = `
       <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-      Gemini API Active
+      Gemini Active
     `;
   } else {
-    badge.className = "inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-[var(--font-small)] font-medium bg-purple-950/50 border border-purple-500/30 text-purple-300";
+    badge.className = "sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[var(--font-small)] font-semibold bg-purple-950/50 border border-purple-500/25 text-purple-300";
     badge.innerHTML = `
       <span class="w-1.5 h-1.5 rounded-full bg-purple-400"></span>
       Demo Mode
@@ -929,4 +1040,1259 @@ document.addEventListener('DOMContentLoaded', () => {
       }
     }
   });
+
+  // Initialize Tarang Voice Assistant Widget UI State
+  initTarangWidgetUI();
+
+  // Wire up manual mic trigger
+  const micContainer = document.getElementById('tarang-mic-container');
+  if (micContainer) {
+    micContainer.addEventListener('click', () => {
+      handleTarangMicClick();
+    });
+  }
 });
+
+// ==========================================
+// Tarang Voice Assistant — Always-On Engine
+// (Single continuous recognizer, Siri/Google style)
+let tarangRecognizer = null;      // The one and only recognizer instance
+let audioCtx = null;
+let analyserNode = null;
+let visualizerFrameId = null;
+let vizStream = null;
+let tarangEnabled = true;          // Is the assistant toggled ON?
+let tarangActive = false;          // Is the microphone engine active?
+let tarangWake = false;            // Is the assistant awake/conversational?
+let tarangSpeaking = false;        // Is TTS playing? (block re-listen while speaking)
+let tarangDetectedLang = 'en';     // Last detected language
+let tarangMoodBuffer = '';         // Accumulated mood description from voice
+let tarangSilenceTimer = null;     // 2s silence detector timer
+let tarangNetworkRetryDelay = 200; // Restart delay in ms (backs off on network error)
+
+// Gemini Backend Transcription Fallback State
+let useBackendTranscription = false;
+let isCommandMode = false;
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let lastSpeechTime = 0;
+let hasUserSpoken = false;
+let maxRecordingTimeout = null;
+
+// Music volume ducking when assistant is awake/speaking
+let originalPlayerVolume = 80;
+
+function duckMusic() {
+  if (ytPlayer && typeof ytPlayer.setVolume === 'function') {
+    try {
+      originalPlayerVolume = ytPlayer.getVolume() || 80;
+      ytPlayer.setVolume(15); // Duck to 15% volume
+      console.log(`[Tarang Jarvis] Ducking music volume to 15% (was ${originalPlayerVolume}%)`);
+    } catch (e) {}
+  }
+}
+
+function unduckMusic() {
+  if (ytPlayer && typeof ytPlayer.setVolume === 'function') {
+    try {
+      ytPlayer.setVolume(originalPlayerVolume);
+      console.log(`[Tarang Jarvis] Restoring music volume to ${originalPlayerVolume}%`);
+    } catch (e) {}
+  }
+}
+
+// 1. INIT
+function initTarangWidgetUI() {
+  const savedEnabled = localStorage.getItem('tarang_enabled');
+  tarangEnabled = (savedEnabled !== 'false'); // Default to true
+
+  const toggleEl = document.getElementById('tarang-toggle');
+  if (toggleEl) {
+    toggleEl.checked = tarangEnabled;
+    // Remove previous listeners if any (by replacing toggle node, or just attaching cleanly)
+    toggleEl.addEventListener('change', (e) => {
+      tarangEnabled = e.target.checked;
+      localStorage.setItem('tarang_enabled', tarangEnabled ? 'true' : 'false');
+      if (tarangEnabled) {
+        tarangStart();
+      } else {
+        tarangStop();
+      }
+    });
+  }
+
+  if (tarangEnabled) {
+    tarangStart();
+  } else {
+    setTarangState('disabled');
+  }
+}
+
+// 2. MIC BUTTON CLICK
+async function handleTarangMicClick() {
+  if (!tarangEnabled) {
+    showToast('Please enable Tarang Voice Assistant using the toggle switch first.', false);
+    return;
+  }
+
+  if (useBackendTranscription) {
+    if (tarangSpeaking) {
+      if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+      tarangSpeaking = false;
+      playChime('error');
+      setTarangState('passive_listening');
+      return;
+    }
+    
+    if (isRecording) {
+      // User tapped the mic button while recording -> Manual stop!
+      stopRecording();
+      return;
+    }
+    
+    if (state.tarangState === 'waiting_for_curate') {
+      // Command mode
+      isCommandMode = true;
+      playChime('start');
+      setTarangState('listening_mood');
+      const transcriptEl = document.getElementById('tarang-transcript');
+      if (transcriptEl) transcriptEl.textContent = 'Speak command now...';
+      startRecording();
+    } else {
+      // Check if mood is already set
+      const moodInput = document.getElementById('mood-input');
+      const hasMood = moodInput && moodInput.value.trim().length > 0;
+      if (hasMood) {
+        isCommandMode = true;
+        playChime('start');
+        setTarangState('listening_mood');
+        const transcriptEl = document.getElementById('tarang-transcript');
+        if (transcriptEl) transcriptEl.textContent = 'Speak command now...';
+        startRecording();
+      } else {
+        triggerWakeUp();
+      }
+    }
+  } else {
+    if (tarangWake) {
+      // Put to sleep
+      tarangWake = false;
+      playChime('error');
+      setTarangState('passive_listening');
+      if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+      
+      // Restart in passive listening mode
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SR) tarangStartListening(SR);
+    } else {
+      // Wake up
+      triggerWakeUp();
+    }
+  }
+}
+
+// 3. START — Start background passive listening
+async function tarangStart() {
+  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SpeechRecognition && !useBackendTranscription) {
+    console.warn("SpeechRecognition not supported in browser. Switching to backend transcription fallback.");
+    useBackendTranscription = true;
+  }
+
+  tarangEnabled = true;
+  tarangActive = true;
+  tarangWake = false;
+  tarangMoodBuffer = '';
+  setTarangState('passive_listening');
+
+  // Request mic stream for visualizer & recorder
+  try {
+    if (!vizStream) {
+      vizStream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
+      startVisualizer(vizStream);
+    }
+  } catch (e) {
+    console.warn('Visualizer mic denied/failed:', e);
+    showToast('Microphone access denied. Please allow mic permissions.', true);
+    tarangStop();
+    return;
+  }
+
+  if (useBackendTranscription) {
+    console.log('[Tarang] Running in Gemini backend transcription fallback mode (Tap-to-Speak).');
+    setTarangState('passive_listening');
+  } else {
+    tarangStartListening(SpeechRecognition);
+  }
+}
+
+// 4. ALWAYS-ON CONTINUOUS RECOGNIZER
+function tarangStartListening(SpeechRecognition) {
+  if (!tarangEnabled || !tarangActive) return;
+  if (tarangSpeaking) return;
+
+  if (useBackendTranscription) {
+    // Branch off and do not initialize standard SpeechRecognition
+    return;
+  }
+
+  if (tarangRecognizer) {
+    try { tarangRecognizer.abort(); } catch(e) {}
+    tarangRecognizer = null;
+  }
+
+  try {
+    tarangRecognizer = new SpeechRecognition();
+    tarangRecognizer.continuous = true;
+    tarangRecognizer.interimResults = true;
+    tarangRecognizer.maxAlternatives = 1;
+    tarangRecognizer.lang = navigator.language || 'en-IN';
+
+    const moodInput = document.getElementById('mood-input');
+    const transcriptEl = document.getElementById('tarang-transcript');
+
+    tarangRecognizer.onstart = () => {
+      if (tarangWake) {
+        if (state.tarangState === 'greeting') {
+          setTarangState('greeting');
+        } else if (state.tarangState === 'listening_mood') {
+          setTarangState('listening_mood');
+        } else {
+          setTarangState('waiting_for_curate');
+        }
+      } else {
+        setTarangState('passive_listening');
+      }
+      console.log('[Tarang] Recognizer started in state:', state.tarangState);
+    };
+
+    tarangRecognizer.onresult = (event) => {
+      let interim = '';
+      let justFinal = '';
+
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const t = event.results[i][0].transcript;
+        if (event.results[i].isFinal) {
+          justFinal += t;
+        } else {
+          interim += t;
+        }
+      }
+
+      // Realtime console acknowledgement of heard speech
+      console.log(`[Tarang Live Speech Heard] Interim: "${interim}" | Final: "${justFinal}"`);
+
+      // Reset network backoff delay on successful recognition results
+      tarangNetworkRetryDelay = 200;
+
+      // Check for wake words anytime (flexible wake up, stops other tasks)
+      const spoken = (justFinal + ' ' + interim).toLowerCase();
+      const wakeWords = ['tarang', 'taran', 'tarun', 'taranga', 'terang', 'hello assistant', 'hey assistant', 'jarvis', 'wake up', 'wake-up', 'chalu ho', 'chalo'];
+      const heardWakeWord = wakeWords.some(w => spoken.includes(w));
+
+      if (heardWakeWord && !tarangSpeaking && state.tarangState !== 'greeting') {
+        console.log(`[Tarang Jarvis] Continuous Wake word intercepted in spoken text: "${spoken}"`);
+        if (typeof speechSynthesis !== 'undefined') {
+          speechSynthesis.cancel();
+        }
+        triggerWakeUp();
+        return;
+      }
+
+      // Check awake status
+      if (!tarangWake) {
+        // If not awake and no wake word, ignore speech input
+        return;
+      } else {
+        // AWAKE
+        if (state.tarangState === 'listening_mood') {
+          // Live transcribing user's mood
+          const currentSpeech = (justFinal || interim).trim();
+          if (currentSpeech) {
+            // Give live acknowledgement of transcribing
+            const statusEl = document.getElementById('tarang-status');
+            if (statusEl) statusEl.textContent = 'Transcribing mood...';
+            
+            if (transcriptEl) {
+              transcriptEl.textContent = currentSpeech;
+            }
+          }
+
+          if (justFinal) {
+            // Append final results to mood buffer
+            tarangMoodBuffer = (tarangMoodBuffer + ' ' + justFinal.trim()).trim();
+            if (moodInput) {
+              moodInput.value = tarangMoodBuffer;
+              moodInput.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+          }
+
+          // Reset silence timer on any speech input
+          if (tarangSilenceTimer) clearTimeout(tarangSilenceTimer);
+          if (interim.trim() || justFinal.trim() || tarangMoodBuffer.trim()) {
+            tarangSilenceTimer = setTimeout(() => {
+              commitMoodAndStopListening();
+            }, 1200); // 1.2s silence detector
+          }
+        } else if (state.tarangState === 'waiting_for_curate') {
+          if (justFinal) {
+            routeTarangCommand(justFinal.trim().toLowerCase());
+          }
+        }
+      }
+    };
+
+    tarangRecognizer.onerror = (event) => {
+      if (event.error === 'no-speech' || event.error === 'aborted') return;
+      console.warn('[Tarang] Recognition error:', event.error);
+      
+      // SWITCH TO BACKEND TRANSCRIPTION ON NETWORK ERROR
+      if (event.error === 'network') {
+        console.warn(`[Tarang] Speech recognition network error detected. Switching to Gemini Backend Transcription fallback!`);
+        showToast('Speech recognition network error. Switching to Gemini fallback...', false);
+        useBackendTranscription = true;
+        
+        // Stop current recognizer and transition
+        tarangWake = false;
+        if (tarangRecognizer) {
+          try { tarangRecognizer.abort(); } catch(e) {}
+          tarangRecognizer = null;
+        }
+        
+        // Restart in backend fallback mode
+        tarangStart();
+        return;
+      }
+
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        showToast('Microphone access denied. Please allow mic permissions.', true);
+        tarangStop();
+      }
+    };
+
+    tarangRecognizer.onend = () => {
+      console.log('[Tarang] Recognizer ended. Active:', tarangActive, 'Speaking:', tarangSpeaking);
+      if (tarangEnabled && tarangActive && !tarangSpeaking) {
+        // Use backoff delay if set, otherwise standard 200ms
+        const delay = tarangNetworkRetryDelay;
+        setTimeout(() => {
+          if (tarangEnabled && tarangActive && !tarangSpeaking) {
+            tarangStartListening(SpeechRecognition);
+          }
+        }, delay);
+      }
+    };
+
+    tarangRecognizer.start();
+
+  } catch (err) {
+    console.error('[Tarang] Could not start recognizer:', err);
+    showToast('Could not start microphone. Check permissions.', true);
+    tarangStop();
+  }
+}
+
+// 5. TRIGGER WAKE UP
+async function triggerWakeUp() {
+  tarangWake = true;
+  tarangMoodBuffer = '';
+  
+  if (tarangRecognizer) {
+    try { tarangRecognizer.abort(); } catch(e) {}
+    tarangRecognizer = null;
+  }
+  
+  setTarangState('greeting');
+  playChime('start');
+  duckMusic();
+  
+  await tarangSpeak("Hello Sir, please tell me your mood right now.", 'en');
+  if (!tarangEnabled || !tarangWake) return; // check if stopped/cancelled
+  
+  // Clear any existing mood in field
+  const moodInput = document.getElementById('mood-input');
+  if (moodInput) {
+    moodInput.value = '';
+    moodInput.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  const transcriptEl = document.getElementById('tarang-transcript');
+  if (transcriptEl) transcriptEl.textContent = 'Speak your mood now';
+  
+  setTarangState('listening_mood');
+  
+  if (useBackendTranscription) {
+    startRecording();
+  } else {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SR) tarangStartListening(SR);
+  }
+}
+
+// 6. COMMIT MOOD ONCE USER STOPS SPEAKING (SILENCE DETECTED)
+async function commitMoodAndStopListening() {
+  if (tarangSilenceTimer) clearTimeout(tarangSilenceTimer);
+  tarangSilenceTimer = null;
+
+  tarangSpeaking = true;
+  if (tarangRecognizer) {
+    try { tarangRecognizer.abort(); } catch(e) {}
+    tarangRecognizer = null;
+  }
+
+  playChime('success');
+  setTarangState('waiting_for_curate');
+
+  const moodInput = document.getElementById('mood-input');
+  const finalMood = moodInput ? moodInput.value.trim() : '';
+  tarangDetectedLang = detectTextLanguage(finalMood);
+
+  let ackText = "I've noted your mood. You can verify it and say 'Curate my mood' when ready.";
+  if (tarangDetectedLang === 'hi') {
+    ackText = "मैंने आपका मूड नोट कर लिया है। आप 'क्यूरेट माय मूड' बोलकर संगीत शुरू कर सकते हैं।";
+  } else if (tarangDetectedLang === 'gu') {
+    ackText = "મેં તમારો મૂડ નોંધી લીધો છે. તમે 'ક્યુરેટ માય મૂડ' બોલીને સંગીત શરૂ કરી શકો છો.";
+  }
+
+  const transcriptEl = document.getElementById('tarang-transcript');
+  if (transcriptEl) {
+    transcriptEl.textContent = finalMood || "Mood captured";
+  }
+
+  await tarangSpeak(ackText, tarangDetectedLang);
+  tarangSpeaking = false;
+  unduckMusic();
+
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (SR && tarangEnabled && tarangWake) {
+    tarangStartListening(SR);
+  }
+}
+
+// 6b. BACKEND RECORDING FUNCTIONS (FALLBACK MODE)
+// Start MediaRecorder recording
+function startRecording() {
+  if (!vizStream) {
+    console.warn("No mic stream available for recording.");
+    return;
+  }
+  
+  audioChunks = [];
+  try {
+    let options = { mimeType: 'audio/webm' };
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      options = { mimeType: 'audio/ogg' };
+    }
+    if (!MediaRecorder.isTypeSupported(options.mimeType)) {
+      options = {}; // fallback to default
+    }
+    
+    mediaRecorder = new MediaRecorder(vizStream, options);
+    
+    mediaRecorder.ondataavailable = (event) => {
+      if (event.data && event.data.size > 0) {
+        audioChunks.push(event.data);
+      }
+    };
+    
+    mediaRecorder.onstop = () => {
+      const mimeType = mediaRecorder.mimeType || 'audio/webm';
+      const audioBlob = new Blob(audioChunks, { type: mimeType });
+      console.log(`[Tarang Recording] Finished. Blob size: ${audioBlob.size} bytes. MimeType: ${mimeType}`);
+      uploadAndTranscribe(audioBlob, mimeType);
+    };
+    
+    mediaRecorder.start(100); // deliver data chunks every 100ms
+    isRecording = true;
+    hasUserSpoken = false;
+    lastSpeechTime = Date.now();
+    console.log("[Tarang Recording] Started MediaRecorder.");
+    
+    // Set a safeguard timeout (20s max recording)
+    if (maxRecordingTimeout) clearTimeout(maxRecordingTimeout);
+    maxRecordingTimeout = setTimeout(() => {
+      if (isRecording) {
+        console.log("[Tarang Recording] Max recording limit reached (20s). Stopping.");
+        stopRecording();
+      }
+    }, 20000);
+    
+  } catch (err) {
+    console.error("[Tarang Recording] Failed to start MediaRecorder:", err);
+    showToast("Could not start audio recorder.", true);
+  }
+}
+
+// Stop MediaRecorder recording
+function stopRecording() {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+  }
+  isRecording = false;
+  if (maxRecordingTimeout) {
+    clearTimeout(maxRecordingTimeout);
+    maxRecordingTimeout = null;
+  }
+}
+
+// Convert Blob to base64 and upload to backend
+function uploadAndTranscribe(audioBlob, mimeType) {
+  setTarangState('processing');
+  
+  if (!state.apiKey) {
+    showToast("Please set your Gemini API key in settings to use voice transcription.", true);
+    playChime('error');
+    setTarangState('passive_listening');
+    tarangSpeak("Please configure your Gemini API key in settings to enable this feature.", 'en');
+    isCommandMode = false;
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.readAsDataURL(audioBlob);
+  reader.onloadend = async () => {
+    try {
+      const base64data = reader.result.split(',')[1];
+      
+      const requestPayload = {
+        audio: base64data,
+        mimeType: mimeType,
+        apiKey: state.apiKey
+      };
+      
+      if (isCommandMode) {
+        console.log("[Tarang] Sending audio to /api/transcribe...");
+        const response = await fetch('/api/transcribe', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestPayload)
+        });
+        
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        const transcribedText = (data.transcript || '').trim();
+        const detectedLang = data.language || 'en';
+        
+        console.log(`[Tarang Backend Transcription] Result: "${transcribedText}" (Lang: ${detectedLang})`);
+        
+        isCommandMode = false;
+        if (transcribedText) {
+          const transcriptEl = document.getElementById('tarang-transcript');
+          if (transcriptEl) transcriptEl.textContent = transcribedText;
+          routeTarangCommand(transcribedText);
+        } else {
+          tarangRespondAndListen("I didn't hear any command. Please try again.", 'en');
+        }
+      } else {
+        console.log("[Tarang] Sending audio to /api/voice-curate...");
+        const response = await fetch('/api/voice-curate', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(requestPayload)
+        });
+        
+        if (!response.ok) {
+          const errorData = await response.json().catch(() => ({}));
+          throw new Error(errorData.error || `HTTP ${response.status}`);
+        }
+        
+        const data = await response.json();
+        const songs = data.songs || [];
+        const voiceResponse = data.voiceResponse || "";
+        const detectedLang = data.detectedLanguage || "en";
+        const detectedMood = data.detectedMood || "";
+        
+        console.log(`[Tarang Backend Voice Curation] Mood: "${detectedMood}" | Lang: "${detectedLang}" | Songs Count: ${songs.length}`);
+        
+        if (songs.length > 0) {
+          const moodInput = document.getElementById('mood-input');
+          if (moodInput) {
+            moodInput.value = detectedMood;
+            moodInput.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          
+          tarangDetectedLang = detectedLang;
+          
+          // Commit mood and play success chime
+          tarangSpeaking = true;
+          playChime('success');
+          setTarangState('greeting');
+          
+          const transcriptEl = document.getElementById('tarang-transcript');
+          if (transcriptEl) {
+            transcriptEl.textContent = `Mood: ${detectedMood}`;
+          }
+          
+          await tarangSpeak(voiceResponse, detectedLang);
+          tarangSpeaking = false;
+          unduckMusic();
+          
+          // Verify playability of the returned songs in parallel!
+          await verifyAndPlayVoiceCuration(songs, detectedMood);
+        } else {
+          playChime('error');
+          setTarangState('passive_listening');
+          await tarangSpeak("Sorry, I could not curate any songs for your mood. Please try again.", 'en');
+          unduckMusic();
+        }
+      }
+    } catch (err) {
+      console.error("[Tarang Voice Pipeline] Failure:", err);
+      showToast("Voice curation failed: " + (err.message || err), true);
+      playChime('error');
+      setTarangState('passive_listening');
+      await tarangSpeak("Sorry, there was an error processing your voice input. Please try again.", 'en');
+      isCommandMode = false;
+      unduckMusic();
+    }
+  };
+}
+
+// Verify playability of voice-curated candidates and load them into active playback
+async function verifyAndPlayVoiceCuration(candidates, vibe) {
+  if (state.curating) return;
+  
+  state.curating = true;
+  const button = document.getElementById('curate-btn');
+  const buttonText = document.getElementById('btn-text');
+  const buttonIcon = document.getElementById('btn-icon');
+  
+  if (button && buttonText && buttonIcon) {
+    button.disabled = true;
+    button.classList.add('opacity-85', 'cursor-not-allowed');
+    buttonText.textContent = 'Curating vibe…';
+    buttonIcon.innerHTML = `
+      <svg class="animate-spin h-5 w-5 text-white" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+      </svg>
+    `;
+  }
+  
+  renderSkeleton();
+  saveVibeToHistory(vibe);
+  
+  const consolePanel = document.getElementById('verification-console-panel');
+  const consoleLogs = document.getElementById('console-logs');
+  if (consolePanel) consolePanel.classList.remove('hidden');
+  if (consoleLogs) consoleLogs.innerHTML = '';
+  
+  writeConsoleLog(`Initializing playability validation for Voice-Curated songs: "${vibe}"`, 'info');
+  writeConsoleLog("Verifying recommendations list…", "header");
+  
+  try {
+    const workingSongs = [];
+    
+    // Verify candidates batch-by-batch
+    const BATCH_SIZE = 5;
+    for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
+      if (workingSongs.length >= 20) break;
+      
+      const batch = candidates.slice(i, i + BATCH_SIZE);
+      const batchPromises = batch.map(async (song) => {
+        if (workingSongs.length >= 20) return;
+        
+        const trackId = `"${song.title}"`;
+        try {
+          const query = `${song.title} ${song.artist} song`;
+          writeConsoleLog(`Checking: ${trackId} by ${song.artist}`, "info");
+          
+          const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
+          if (response.ok) {
+            const data = await response.json();
+            if (data.candidates && data.candidates.length > 0) {
+              data.candidates.forEach((cand, cIdx) => {
+                const status = cand.ok 
+                  ? "PLAYABLE" 
+                  : `UNPLAYABLE (${cand.status}${cand.reason ? ': ' + cand.reason : ''})`;
+                writeConsoleLog(`  [Cand ${cIdx+1}] ${cand.videoId} → ${status}`, cand.ok ? "pass" : "fail");
+              });
+            }
+            if (data.videoId) {
+              song.videoId = data.videoId;
+              workingSongs.push(song);
+              writeConsoleLog(`✓ [${workingSongs.length}/20] ${trackId} → ${data.videoId}`, "pass");
+              if (buttonText) buttonText.textContent = `Verified ${workingSongs.length} songs…`;
+            } else {
+              song.videoId = null;
+              writeConsoleLog(`✗ ${trackId} — no embeddable video found`, "fail");
+            }
+          } else {
+            song.videoId = null;
+            writeConsoleLog(`✗ ${trackId} — search API error`, "fail");
+          }
+        } catch (err) {
+          song.videoId = null;
+          writeConsoleLog(`✗ ${trackId} — network error: ${err.message}`, "fail");
+        }
+      });
+      await Promise.all(batchPromises);
+    }
+    
+    const finalPlaylist = workingSongs.slice(0, 20);
+    writeConsoleLog("Playability Validation Complete", "header");
+    writeConsoleLog(`Results: Total ${finalPlaylist.length} verified playable songs presented.`, "info");
+    
+    if (finalPlaylist.length === 0) {
+      writeConsoleLog("CRITICAL: Zero playable streams found.", "fail");
+      throw new Error("Could not resolve any working video streams. Please try another mood description.");
+    }
+    
+    renderSongs(finalPlaylist, 'gemini');
+    applyAmbientTheme(vibe);
+    
+    writeConsoleLog("Voice curation complete. Launching playback.", "info");
+    playRandomSong();
+    
+  } catch (error) {
+    console.error("Voice curation validation error:", error);
+    renderError(error.message);
+  } finally {
+    state.curating = false;
+    if (button && buttonText && buttonIcon) {
+      button.disabled = false;
+      button.classList.remove('opacity-85', 'cursor-not-allowed');
+      buttonText.textContent = 'Curate Music';
+      buttonIcon.innerHTML = `
+        <svg class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+        </svg>
+      `;
+    }
+  }
+}
+
+// 7. COMMAND ROUTER
+function routeTarangCommand(text) {
+  // Stop / Pause
+  const stopWords = ['stop', 'pause', 'ruk', 'ruko', 'band', 'bandh', 'band karo', 'bandh karo', 'roko', 'stop music', 'pause music'];
+  if (stopWords.some(w => text.includes(w))) {
+    if (ytPlayer && ytPlayer.pauseVideo) {
+      try { ytPlayer.pauseVideo(); } catch(e) {}
+    }
+    tarangRespondAndListen('Music paused.', 'en');
+    return;
+  }
+
+  // Resume / Play
+  const resumeWords = ['resume', 'unpause', 'continue playing', 'play music'];
+  if (resumeWords.some(w => text.includes(w))) {
+    if (ytPlayer && ytPlayer.playVideo) {
+      try { ytPlayer.playVideo(); } catch(e) {}
+    }
+    tarangRespondAndListen('Resuming.', 'en');
+    return;
+  }
+
+  // Next / Skip
+  const nextWords = ['next', 'next song', 'skip', 'agle', 'agla', 'badlo', 'aagad', 'skip song', 'next track'];
+  if (nextWords.some(w => text.includes(w))) {
+    playNext();
+    const msg = tarangDetectedLang === 'hi' ? 'अगला गाना चला रहा हूँ।' : tarangDetectedLang === 'gu' ? 'આગળ ગીત ચાલી રહ્યું છે.' : 'Playing next song.';
+    tarangRespondAndListen(msg, tarangDetectedLang);
+    return;
+  }
+
+  // Random
+  const randomWords = ['random', 'shuffle', 'any song', 'play something', 'koi bhi', 'koi bi'];
+  if (randomWords.some(w => text.includes(w))) {
+    playRandomSong();
+    tarangRespondAndListen('Playing a random song.', 'en');
+    return;
+  }
+
+  // Curate my mood
+  const lowerText = text.toLowerCase();
+  const curateKeywords = [
+    'curate', 'let\'s curate', 'lets curate', 'curate my mood', 'curate my mode', 
+    'suggest songs', 'play songs', 'suggest track', 'find songs', 'get songs', 
+    'songs based on', 'mode description', 'gaane bajao', 'gana bajao', 'gaane sunao', 
+    'music lagao', 'baja do', 'bajao', 'gaane lagao', 'play music', 'suggest music',
+    'curate music', 'curate mode', 'curate mood'
+  ];
+
+  const matchesCuration = curateKeywords.some(w => lowerText.includes(w)) ||
+                          (lowerText.includes('curate') && (lowerText.includes('mood') || lowerText.includes('mode'))) ||
+                          (lowerText.includes('suggest') && (lowerText.includes('song') || lowerText.includes('music') || lowerText.includes('track') || lowerText.includes('playlist'))) ||
+                          (lowerText.includes('let\'s') && lowerText.includes('curate')) ||
+                          (lowerText.includes('lets') && lowerText.includes('curate'));
+
+  if (matchesCuration) {
+    const moodInput = document.getElementById('mood-input');
+    const moodText = moodInput ? moodInput.value.trim() : '';
+    if (!moodText) {
+      // Empty validation: Ask and transition to listening_mood
+      tarangSpeaking = true;
+      if (tarangRecognizer) { try { tarangRecognizer.abort(); } catch(e) {} tarangRecognizer = null; }
+      duckMusic();
+      
+      tarangSpeak("First Tell me your mood, then I'll curate it.", 'en').then(() => {
+        tarangSpeaking = false;
+        tarangMoodBuffer = '';
+        if (moodInput) moodInput.value = '';
+        const transcriptEl = document.getElementById('tarang-transcript');
+        if (transcriptEl) transcriptEl.textContent = 'Speak your mood now';
+        setTarangState('listening_mood');
+        
+        if (useBackendTranscription) {
+          startRecording();
+        } else {
+          const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+          if (SR && tarangEnabled && tarangWake) tarangStartListening(SR);
+        }
+      });
+    } else {
+      triggerCurationFromVoice();
+    }
+    return;
+  }
+
+  // Play specific song
+  const playSpecificMatch = text.match(/^(?:play|baja|laga|sun|sunao|chalao)\s+(.+)$/i);
+  if (playSpecificMatch && playSpecificMatch[1] && playSpecificMatch[1].length > 2) {
+    const songName = playSpecificMatch[1].trim();
+    if (!['music', 'songs', 'song', 'something', 'random', 'shuffle', 'curate', 'my mood'].includes(songName)) {
+      tarangPlaySpecificSong(songName);
+      return;
+    }
+  }
+
+  // Sleep / Turn off
+  const offWords = ['goodbye tarang', 'bye tarang', 'stop listening', 'sleep', 'go to sleep', 'so jao', 'bye', 'goodbye'];
+  if (offWords.some(w => text.includes(w))) {
+    tarangRespondAndListen('Goodbye! Wake me up anytime.', 'en').then(() => {
+      tarangWake = false;
+      setTarangState('passive_listening');
+    });
+    return;
+  }
+
+  // Treat anything else as addition to mood description if they are in passive/command state and say something
+  const statusEl = document.getElementById('tarang-status');
+  if (statusEl && state.tarangState === 'waiting_for_curate') {
+    statusEl.textContent = 'Say "Curate my mood"';
+  }
+}
+
+// 8. PLAY SPECIFIC SONG BY NAME
+async function tarangPlaySpecificSong(songName) {
+  setTarangState('processing');
+
+  tarangSpeaking = true;
+  if (tarangRecognizer) { try { tarangRecognizer.abort(); } catch(e) {} tarangRecognizer = null; }
+
+  await tarangSpeak(`Looking for ${songName} on YouTube.`, 'en');
+  tarangSpeaking = false;
+
+  writeConsoleLog(`Voice: Searching for specific song — "${songName}"`, 'info');
+
+  try {
+    const response = await fetch(`/api/search?q=${encodeURIComponent(songName + ' song')}`);
+    const data = await response.json();
+    if (data.videoId) {
+      const tempSong = { title: songName, artist: 'As Requested', videoId: data.videoId, explanation: 'Played by your voice command.' };
+      state.playlist.unshift(tempSong);
+      playSongAtIndex(0);
+
+      const msg = `Playing ${songName} now!`;
+      await tarangSpeak(msg, 'en');
+    } else {
+      await tarangSpeak(`Sorry, I couldn't find ${songName} on YouTube.`, 'en');
+    }
+  } catch (e) {
+    await tarangSpeak(`Network error searching for ${songName}.`, 'en');
+  } finally {
+    tarangSpeaking = false;
+    if (tarangEnabled && tarangActive) {
+      if (useBackendTranscription) {
+        setTarangState('waiting_for_curate');
+      } else {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (SR) tarangStartListening(SR);
+      }
+    }
+  }
+}
+
+// 9. RESPOND AND RESUME LISTENING
+async function tarangRespondAndListen(text, lang) {
+  tarangSpeaking = true;
+  setTarangState('greeting');
+
+  if (tarangRecognizer) { try { tarangRecognizer.abort(); } catch(e) {} tarangRecognizer = null; }
+
+  await tarangSpeak(text, lang || tarangDetectedLang);
+
+  tarangSpeaking = false;
+  if (tarangEnabled && tarangActive) {
+    if (useBackendTranscription) {
+      setTarangState('waiting_for_curate');
+    } else {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (SR) tarangStartListening(SR);
+    }
+  }
+}
+
+// 10. SPEAK TEXT (TTS)
+function tarangSpeak(text, langCode) {
+  return new Promise((resolve) => {
+    if (typeof speechSynthesis === 'undefined') { resolve(); return; }
+
+    speechSynthesis.cancel();
+
+    const utter = new SpeechSynthesisUtterance(text);
+    let voiceLang = 'en-IN';
+    if (langCode === 'hi') voiceLang = 'hi-IN';
+    if (langCode === 'gu') voiceLang = 'gu-IN';
+    utter.lang = voiceLang;
+    utter.rate = 1.05;
+    utter.pitch = 1.0;
+    utter.volume = 1.0;
+
+    const voices = speechSynthesis.getVoices();
+    const pick = voices.find(v => v.lang.startsWith(voiceLang))
+                 || voices.find(v => v.lang.startsWith(langCode))
+                 || voices.find(v => v.lang.startsWith('en'))
+                 || voices[0];
+    if (pick) utter.voice = pick;
+
+    utter.onend = () => resolve();
+    utter.onerror = () => resolve();
+
+    const timeout = setTimeout(() => resolve(), 10000);
+    utter.onend = () => { clearTimeout(timeout); resolve(); };
+
+    speechSynthesis.speak(utter);
+  });
+}
+
+// 11. STOP THE ASSISTANT COMPLETELY
+function tarangStop() {
+  tarangActive = false;
+  tarangWake = false;
+  tarangSpeaking = false;
+  tarangEnabled = false;
+
+  if (isRecording) {
+    stopRecording();
+  }
+
+  const toggleEl = document.getElementById('tarang-toggle');
+  if (toggleEl) {
+    toggleEl.checked = false;
+  }
+  localStorage.setItem('tarang_enabled', 'false');
+  
+  if (tarangSilenceTimer) {
+    clearTimeout(tarangSilenceTimer);
+    tarangSilenceTimer = null;
+  }
+
+  if (tarangRecognizer) {
+    try { tarangRecognizer.abort(); } catch(e) {}
+    tarangRecognizer = null;
+  }
+
+  if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+
+  stopVisualizer();
+  if (vizStream) {
+    vizStream.getTracks().forEach(t => t.stop());
+    vizStream = null;
+  }
+
+  setTarangState('disabled');
+  playChime('error');
+  console.log('[Tarang] Stopped.');
+}
+
+// 12. TRIGGER CURATION FROM VOICE
+async function triggerCurationFromVoice() {
+  const moodInput = document.getElementById('mood-input');
+  const moodText = moodInput ? moodInput.value.trim() : '';
+
+  if (!moodText) {
+    tarangRespondAndListen("First Tell me your mood, then I'll curate it.", 'en');
+    return;
+  }
+
+  playChime('success');
+  tarangSpeaking = true;
+  if (tarangRecognizer) { try { tarangRecognizer.abort(); } catch(e) {} tarangRecognizer = null; }
+
+  const confirmText = tarangDetectedLang === 'hi'
+    ? 'जी बिलकुल! अभी आपके मूड के लिए गाने खोज रहा हूँ।'
+    : tarangDetectedLang === 'gu'
+    ? 'ચોક્કસ! હમણાં જ તમારા મૂડ માટે ગીતો શોધું છું.'
+    : 'Got it! Curating your perfect playlist right now.';
+
+  await tarangSpeak(confirmText, tarangDetectedLang);
+  tarangSpeaking = false;
+
+  setTarangState('idle');
+  handleCuration(moodText);
+}
+
+// 13. LEGACY SHIMS
+function stopAllVoiceSynthesizersAndRecognizers() {
+  if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+  if (tarangRecognizer) { try { tarangRecognizer.abort(); } catch(e) {} tarangRecognizer = null; }
+}
+
+// 14. UI STATE MACHINE
+function setTarangState(stateName) {
+  state.tarangState = stateName;
+  const statusEl = document.getElementById('tarang-status');
+  const transcriptEl = document.getElementById('tarang-transcript');
+  const dotEl = document.getElementById('tarang-state-dot');
+  const micContainer = document.getElementById('tarang-mic-container');
+  const bars = document.getElementById('tarang-bars');
+  const micIcon = document.getElementById('tarang-mic-icon');
+  const widget = document.getElementById('tarang-widget');
+
+  if (!statusEl || !dotEl || !micContainer || !widget) return;
+
+  const BASE_MIC = 'relative w-[3.25rem] h-[3.25rem] rounded-full flex items-center justify-center border shadow-lg cursor-pointer overflow-hidden transition-all duration-400';
+  if (bars) bars.classList.add('hidden');
+  widget.classList.remove('disabled');
+
+  if (stateName === 'disabled') {
+    widget.classList.add('disabled');
+    const toggleEl = document.getElementById('tarang-toggle');
+    if (toggleEl) toggleEl.checked = false;
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-zinc-600 border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-zinc-950/20 border-zinc-800/30 cursor-not-allowed`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-zinc-600 relative z-10 transition-colors duration-300';
+    micContainer.classList.remove('siri-pulse-active');
+    statusEl.textContent = 'Assistant Disabled';
+    transcriptEl.textContent = 'Turn on toggle switch';
+
+  } else if (stateName === 'passive_listening') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-purple-500 border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-purple-950/40 border-purple-500/20`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-purple-400 relative z-10 transition-colors duration-300';
+    micContainer.classList.remove('siri-pulse-active');
+    statusEl.textContent = useBackendTranscription ? 'Assistant Active' : 'Listening for "Hey Tarang"...';
+    transcriptEl.textContent = useBackendTranscription ? 'Click mic button to speak' : 'Say "Hey Tarang" or click mic';
+
+  } else if (stateName === 'greeting') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-blue-400 animate-pulse border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-blue-950/40 border-blue-500/40`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-blue-300 relative z-10 transition-colors duration-300';
+    micContainer.classList.remove('siri-pulse-active');
+    statusEl.textContent = 'Tarang is speaking…';
+    if (useBackendTranscription) transcriptEl.textContent = 'Speaking...';
+
+  } else if (stateName === 'listening_mood') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-emerald-400 animate-pulse border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-emerald-950/40 border-emerald-500/45 siri-pulse-active`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-emerald-300 relative z-10 transition-colors duration-300';
+    if (bars) bars.classList.remove('hidden');
+    statusEl.textContent = isCommandMode ? 'Listening for command...' : 'Listening for mood...';
+    if (!tarangMoodBuffer) {
+      transcriptEl.textContent = isCommandMode ? 'Speak your command now' : 'Speak your mood now';
+    }
+
+  } else if (stateName === 'waiting_for_curate') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-violet-400 animate-pulse border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-purple-950/50 border-purple-500/35`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-violet-300 relative z-10 transition-colors duration-300';
+    micContainer.classList.remove('siri-pulse-active');
+    statusEl.textContent = useBackendTranscription ? 'Click mic to say command' : 'Say "Curate my mood"';
+    if (useBackendTranscription) {
+      transcriptEl.textContent = 'Say "Curate my mood" or other commands';
+    }
+
+  } else if (stateName === 'processing') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-amber-400 animate-ping border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-amber-950/40 border-amber-500/40`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-amber-300 relative z-10 transition-colors duration-300';
+    micContainer.classList.remove('siri-pulse-active');
+    statusEl.textContent = 'Processing…';
+    transcriptEl.textContent = 'Working on it';
+
+  } else if (stateName === 'idle') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-purple-500 border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC} bg-purple-950/50 border-purple-500/30`;
+    if (micIcon) micIcon.className = 'h-6 w-6 text-purple-300 relative z-10 transition-colors duration-300';
+    micContainer.classList.remove('siri-pulse-active');
+    statusEl.textContent = 'Ready';
+  }
+}
+
+// 15. CHIME SOUNDS (Web Audio API)
+function playChime(type) {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+
+    if (type === 'start') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(523.25, ctx.currentTime);
+      osc.frequency.setValueAtTime(659.25, ctx.currentTime + 0.08);
+      osc.frequency.setValueAtTime(783.99, ctx.currentTime + 0.16);
+      osc.frequency.setValueAtTime(1046.50, ctx.currentTime + 0.24);
+      gain.gain.setValueAtTime(0.12, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.5);
+      osc.start(); osc.stop(ctx.currentTime + 0.5);
+    } else if (type === 'success') {
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(783.99, ctx.currentTime);
+      osc.frequency.setValueAtTime(1046.50, ctx.currentTime + 0.12);
+      gain.gain.setValueAtTime(0.12, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.4);
+      osc.start(); osc.stop(ctx.currentTime + 0.4);
+    } else if (type === 'error') {
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(220, ctx.currentTime);
+      osc.frequency.setValueAtTime(147, ctx.currentTime + 0.12);
+      gain.gain.setValueAtTime(0.15, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.005, ctx.currentTime + 0.45);
+      osc.start(); osc.stop(ctx.currentTime + 0.45);
+    }
+  } catch (e) {}
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// 14. VISUALIZER (Canvas frequency ring)
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function startVisualizer(stream) {
+  const canvas = document.getElementById('tarang-wave-canvas');
+  if (!canvas) return;
+  const canvasCtx = canvas.getContext('2d');
+  canvas.width = canvas.offsetWidth;
+  canvas.height = canvas.offsetHeight;
+
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyserNode = audioCtx.createAnalyser();
+  analyserNode.fftSize = 64;
+  source.connect(analyserNode);
+
+  const bufferLength = analyserNode.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+  canvas.style.opacity = '1';
+
+  function draw() {
+    visualizerFrameId = requestAnimationFrame(draw);
+    analyserNode.getByteFrequencyData(dataArray);
+    canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // Calculate average volume for silence detection
+    if (useBackendTranscription && isRecording) {
+      let sum = 0;
+      for (let i = 0; i < bufferLength; i++) {
+        sum += dataArray[i];
+      }
+      const averageVolume = sum / bufferLength; // 0 to 255
+      
+      // Let's log levels occasionally for debugging
+      if (Math.random() < 0.05) {
+        console.log(`[Tarang Live Audio Level] Volume: ${averageVolume.toFixed(2)} | Speech Detected: ${averageVolume > 12}`);
+      }
+
+      if (averageVolume > 12) {
+        if (!hasUserSpoken) {
+          hasUserSpoken = true;
+          console.log("[Tarang Silence Detection] Speech started.");
+        }
+        lastSpeechTime = Date.now();
+      } else {
+        const elapsedSinceStart = Date.now() - lastSpeechTime;
+        if (!hasUserSpoken) {
+          // If the user hasn't spoken at all, auto-stop after 4 seconds of silence
+          if (elapsedSinceStart > 4000) {
+            console.log("[Tarang Silence Detection] No speech detected for 4s. Auto-stopping.");
+            stopRecording();
+          }
+        } else {
+          // If the user has spoken, auto-stop after 1.2 seconds of silence
+          if (elapsedSinceStart > 1200) {
+            console.log("[Tarang Silence Detection] 1.2s silence detected. Auto-stopping.");
+            stopRecording();
+          }
+        }
+      }
+    }
+
+    const centerX = canvas.width / 2;
+    const centerY = canvas.height / 2;
+    const baseRadius = canvas.width / 2.6;
+
+    canvasCtx.beginPath();
+    for (let i = 0; i < bufferLength; i++) {
+      const angle = (i / bufferLength) * Math.PI * 2;
+      const val = dataArray[i] / 255;
+      const r = baseRadius + val * 10;
+      const x = centerX + Math.cos(angle) * r;
+      const y = centerY + Math.sin(angle) * r;
+      if (i === 0) canvasCtx.moveTo(x, y);
+      else canvasCtx.lineTo(x, y);
+    }
+    canvasCtx.closePath();
+    canvasCtx.strokeStyle = 'rgba(168, 85, 247, 0.85)';
+    canvasCtx.lineWidth = 3;
+    canvasCtx.shadowBlur = 8;
+    canvasCtx.shadowColor = 'rgba(168, 85, 247, 0.6)';
+    canvasCtx.stroke();
+  }
+  draw();
+}
+
+function stopVisualizer() {
+  if (visualizerFrameId) {
+    cancelAnimationFrame(visualizerFrameId);
+    visualizerFrameId = null;
+  }
+  const canvas = document.getElementById('tarang-wave-canvas');
+  if (canvas) {
+    canvas.style.opacity = '0';
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+  }
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// 15. LANGUAGE DETECTION
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function detectTextLanguage(text) {
+  if (/[\u0900-\u097F]/.test(text)) return 'hi';
+  if (/[\u0A80-\u0AFF]/.test(text)) return 'gu';
+  return 'en';
+}
+
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// 16. AMBIENT THEME SYNC
+// â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function applyAmbientTheme(moodStr) {
+  if (!moodStr) return;
+  const mood = moodStr.toLowerCase();
+  let theme = 'chill';
+
+  if (['cozy','warm','rain','coffee','night','winter','soothing','morning'].some(k => mood.includes(k))) theme = 'cozy';
+  else if (['happy','joy','sun','dance','fun','party','excit','smile'].some(k => mood.includes(k))) theme = 'happy';
+  else if (['sad','cry','lonely','heartbreak','blue','grief','heavy','pain'].some(k => mood.includes(k))) theme = 'sad';
+  else if (['hype','workout','run','motivat','power','energy','fast','gym'].some(k => mood.includes(k))) theme = 'hype';
+  else if (['focus','study','code','work','read','calm','peace'].some(k => mood.includes(k))) theme = 'focus';
+
+  document.body.setAttribute('data-theme', theme);
+  writeConsoleLog(`Visual Sync: Ambient theme â†’ "${theme.toUpperCase()}"`, 'info');
+}
+

@@ -4,6 +4,7 @@ import urllib.request
 import urllib.parse
 import re
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_from_directory
 
 app = Flask(__name__, static_folder='.')
@@ -85,7 +86,7 @@ def static_files(path):
 
 def search_and_verify(query):
     """
-    Scrapes YouTube results page and checks playability of candidates.
+    Scrapes YouTube results page and checks playability of candidates IN PARALLEL.
     Returns (videoId, candidates_log, status)
     """
     try:
@@ -94,7 +95,7 @@ def search_and_verify(query):
         
         req = urllib.request.Request(
             url, 
-            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
         )
         
         html = urllib.request.urlopen(req, timeout=5).read().decode('utf-8')
@@ -110,23 +111,40 @@ def search_and_verify(query):
         
         if not video_ids:
             return None, [], "NO_SEARCH_RESULTS"
-            
+        
+        # Run all playability checks in PARALLEL for maximum speed
         candidates_log = []
+        results_map = {}
+        
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_vid = {executor.submit(check_playability, vid): vid for vid in video_ids}
+            for future in as_completed(future_to_vid):
+                vid = future_to_vid[future]
+                try:
+                    playability = future.result()
+                except Exception as exc:
+                    playability = {"ok": False, "status": "ERROR", "playableInEmbed": False, "reason": str(exc)}
+                results_map[vid] = playability
+        
+        # Preserve original order and find first passing video
+        first_ok_vid = None
         for vid in video_ids:
-            playability = check_playability(vid)
+            playability = results_map.get(vid, {"ok": False, "status": "UNKNOWN", "playableInEmbed": False, "reason": "No result"})
             log_entry = {
                 "videoId": vid,
                 "status": playability["status"],
                 "playableInEmbed": playability["playableInEmbed"],
-                "reason": playability["reason"],
+                "reason": playability.get("reason", ""),
                 "ok": playability["ok"]
             }
             candidates_log.append(log_entry)
-            
-            if playability["ok"]:
-                return vid, candidates_log, "OK"
-                
+            if playability["ok"] and first_ok_vid is None:
+                first_ok_vid = vid
+        
+        if first_ok_vid:
+            return first_ok_vid, candidates_log, "OK"
         return None, candidates_log, "UNPLAYABLE"
+        
     except Exception as e:
         print(f"Error in search_and_verify for query '{query}': {e}")
         return None, [], f"ERROR: {str(e)}"
@@ -196,6 +214,181 @@ def api_search():
         'error': 'All candidates in primary and fallback searches failed playability verification',
         'candidates': combined_candidates
     })
+
+def execute_gemini_multimodal_request(payload, api_key):
+    """
+    Executes a POST request to Gemini, trying multiple model and API version fallbacks 
+    if any candidates fail with a 404/400 (unsupported model/endpoint) error.
+    """
+    models_to_try = [
+        {"name": "gemini-2.0-flash", "version": "v1beta"},
+        {"name": "gemini-2.5-flash", "version": "v1beta"},
+        {"name": "gemini-2.5-flash-lite", "version": "v1beta"},
+        {"name": "gemini-2.5-pro", "version": "v1beta"},
+        {"name": "gemini-flash-latest", "version": "v1beta"},
+    ]
+    
+    last_error = None
+    for model in models_to_try:
+        url = f"https://generativelanguage.googleapis.com/{model['version']}/models/{model['name']}:generateContent?key={api_key}"
+        print(f"Attempting Gemini request on model fallback: {model['name']} ({model['version']})")
+        req_data = json.dumps(payload).encode('utf-8')
+        req = urllib.request.Request(
+            url,
+            data=req_data,
+            headers={'Content-Type': 'application/json'}
+        )
+        try:
+            response = urllib.request.urlopen(req, timeout=40)
+            res_data = response.read().decode('utf-8')
+            res_json = json.loads(res_data)
+            
+            candidates = res_json.get("candidates", [])
+            if candidates:
+                text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                if text:
+                    print(f"Resolved successful response with model: {model['name']}")
+                    return text
+            last_error = "Response body missing candidates or text content"
+        except urllib.error.HTTPError as e:
+            err_body = ""
+            try:
+                err_body = e.read().decode('utf-8')
+            except Exception as read_err:
+                err_body = f"Failed to read body: {read_err}"
+            print(f"Model fallback {model['name']} ({model['version']}) failed with HTTP {e.code}: {e.reason}. Body: {err_body}")
+            last_error = f"HTTP Error {e.code}: {e.reason} - {err_body}"
+        except Exception as e:
+            print(f"Model fallback {model['name']} ({model['version']}) request failed: {e}")
+            last_error = str(e)
+            
+    raise Exception(f"All generative voice models failed. Last error: {last_error}")
+
+@app.route('/api/voice-curate', methods=['POST'])
+def api_voice_curate():
+    data = request.json or {}
+    audio_base64 = data.get('audio', '')
+    mime_type = data.get('mimeType', 'audio/webm')
+    api_key = data.get('apiKey', '')
+    
+    if not audio_base64:
+        return jsonify({'error': 'Audio data is required'}), 400
+    if not api_key:
+        return jsonify({'error': 'Gemini API key is required'}), 400
+        
+    print(f"=== Multimodal Voice Curation Request ({mime_type}) ===")
+    
+    prompt = """You are 'Tarang', a professional conversational Indian voice assistant and music curator.
+    1. Listen to the audio clip and transcribe the user's spoken words.
+    2. Auto-detect if the user is speaking in English, Hindi, Gujarati, or code-mixed Indian languages (e.g. Hinglish/Gujlish).
+    3. Identify the user's mood, feelings, or situation from their spoken description.
+    4. Curate exactly 20 real Hindi/Bollywood songs matching this mood/vibe.
+    5. Output a conversational voice response spoken back in the same language detected (English, Hindi, or Gujarati). Keep it to 1-2 short, natural sentences (e.g., 'मैने आपके मूड के लिए 20 सुंदर गाने तैयार किये हैं। चलिए प्ले करते हैं।' or 'મેં તમારા મૂડ માટે 20 સરસ ગીતો ક્યુરેટ કર્યા છે. ચાલો સાંભળીએ.').
+    
+    IMPORTANT CONSTRAINT: The song recommendations MUST be strictly in the Hindi language (e.g. from Bollywood, Hindi indie, or Hindi classical/pop). Do not recommend songs in English under any circumstances.
+    
+    You must output ONLY a valid JSON object matching the following structure (do not wrap in markdown or backticks):
+    {
+      "detectedMood": "A short English phrase representing the mood",
+      "detectedLanguage": "en | hi | gu",
+      "voiceResponse": "Friendly spoken confirmation text in the user's language",
+      "songs": [
+        {
+          "title": "Song Title",
+          "artist": "Artist Name",
+          "explanation": "Poetic 1-sentence explanation in English of why it matches"
+        }
+      ]
+    }
+    """
+    
+    # Construct the JSON payload with inlineData audio bytes
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": audio_base64
+                    }
+                },
+                {
+                    "text": prompt
+                }
+            ]
+        }]
+    }
+    
+    try:
+        text = execute_gemini_multimodal_request(payload, api_key)
+        clean_text = text.replace("```json", "").replace("```", "").strip()
+        parsed_response = json.loads(clean_text)
+        
+        print(f"Detected Mood: {parsed_response.get('detectedMood')}")
+        print(f"Detected Lang: {parsed_response.get('detectedLanguage')}")
+        print(f"Voice Response: {parsed_response.get('voiceResponse')}")
+        
+        return jsonify(parsed_response)
+        
+    except Exception as e:
+        print(f"Error calling Gemini audio curation API: {e}")
+        return jsonify({'error': f"Gemini Multimodal Audio processing failed: {str(e)}"}), 500
+
+@app.route('/api/transcribe', methods=['POST'])
+def api_transcribe():
+    data = request.json or {}
+    audio_base64 = data.get('audio', '')
+    mime_type = data.get('mimeType', 'audio/webm')
+    api_key = data.get('apiKey', '')
+    
+    if not audio_base64:
+        return jsonify({'error': 'Audio data is required'}), 400
+    if not api_key:
+        return jsonify({'error': 'Gemini API key is required'}), 400
+        
+    print(f"=== Multimodal Voice Transcription Request ({mime_type}) ===")
+    
+    # Ultra-fast plain-text transcription prompt
+    prompt = "Transcribe the user's spoken words in this audio recording. Return ONLY the plain transcription text with no markdown, explanation, or extra characters."
+    
+    payload = {
+        "contents": [{
+            "parts": [
+                {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": audio_base64
+                    }
+                },
+                {
+                    "text": prompt
+                }
+            ]
+        }]
+    }
+    
+    try:
+        text = execute_gemini_multimodal_request(payload, api_key)
+        transcribed_text = text.strip()
+        
+        # Fast regex language classification
+        lang = "en"
+        if re.search(r"[\u0900-\u097F]", transcribed_text):
+            lang = "hi"
+        elif re.search(r"[\u0A80-\u0AFF]", transcribed_text):
+            lang = "gu"
+            
+        print(f"Transcribed Text: {transcribed_text}")
+        print(f"Detected Lang: {lang}")
+        
+        return jsonify({
+            "transcript": transcribed_text,
+            "language": lang
+        })
+        
+    except Exception as e:
+        print(f"Error calling Gemini transcription API: {e}")
+        return jsonify({'error': f"Transcription failed: {str(e)}"}), 500
 
 if __name__ == '__main__':
     # Disable file caching for static files during development
