@@ -51,7 +51,8 @@ app = Flask(__name__, static_folder='.')
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://tarang-music.onrender.com",  # update this after Render deployment
+    "https://mood-to-music.onrender.com",
+    "https://mood-to-music.onrender.com/",
     os.environ.get("FRONTEND_URL", "")    # set this env var in production
 ]
 
