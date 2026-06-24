@@ -2,7 +2,7 @@
 
 // Configuration & State
 const state = {
-  apiKey: localStorage.getItem('gemini_api_key') || '',
+  geminiActive: false,
   curating: false,
   vibeHistory: JSON.parse(localStorage.getItem('vibe_history') || '[]'),
   playlist: [],      // Currently active playlist of 10 songs
@@ -10,6 +10,15 @@ const state = {
   autoplayEnabled: true, // Auto play enabled by default
   source: 'gemini'   // Curation source
 };
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onloadend = () => resolve(reader.result.split(',')[1]);
+    reader.onerror = reject;
+    reader.readAsDataURL(blob);
+  });
+}
 
 let ytPlayer = null; // YouTube Player object
 
@@ -179,109 +188,6 @@ function curateFallback(vibe) {
   return shuffled.slice(0, 20);
 }
 
-// REST call to a single Gemini model with AbortController timeout
-async function makeGeminiRequest(model, version, vibe, apiKey, excludedSongs = [], timeoutMs = 15000) {
-  let exclusionPrompt = '';
-  if (excludedSongs && excludedSongs.length > 0) {
-    exclusionPrompt = `\n- DO NOT include any of the following songs: ${excludedSongs.slice(0, 55).join(', ')}.`;
-  }
-
-  const prompt = `You are a world-class music curator specializing in Indian music. Analyze the user's emotional state described below, and curate EXACTLY 25 real Hindi songs that match this mood.
-
-CONSTRAINTS:
-- Songs MUST be in Hindi (Bollywood, Hindi indie, or Hindi pop/classical). No English songs.
-- Song titles and artists must be real and well-known.${exclusionPrompt}
-- Return EXACTLY 25 items. Variety is important — mix eras, tempos, and artists.
-
-User mood: "${vibe}"
-
-Output a JSON array. No markdown, no wrapping. Each object:
-{"title":"Song Title","artist":"Artist Name","explanation":"1-sentence poetic reason why this matches."}
-
-JSON array:`;
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${apiKey}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json' }
-        })
-      }
-    );
-
-    if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.error?.message || `HTTP ${response.status}`);
-    }
-
-    const data = await response.json();
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("Empty response from AI engine.");
-
-    const cleanText = text.replace(/```json/g, '').replace(/```/g, '').trim();
-    const parsed = JSON.parse(cleanText);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return parsed.slice(0, 25);
-    }
-    throw new Error("AI returned data in an unexpected format.");
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// Optimized Gemini caller — races top 2 models in parallel for speed
-async function curateWithGemini(vibe, apiKey, excludedSongs = []) {
-  // Race the two fastest models simultaneously
-  const fastModels = [
-    { name: 'gemini-2.5-flash', version: 'v1beta' },
-    { name: 'gemini-2.0-flash', version: 'v1beta' }
-  ];
-
-  // Fallback models if both fast ones fail
-  const fallbackModels = [
-    { name: 'gemini-2.0-flash-lite', version: 'v1beta' },
-    { name: 'gemini-1.5-flash', version: 'v1' },
-    { name: 'gemini-1.5-flash', version: 'v1beta' },
-    { name: 'gemini-pro', version: 'v1beta' }
-  ];
-
-  // Phase 1: Race fast models (whoever responds first wins)
-  try {
-    console.log('Racing fast models:', fastModels.map(m => m.name).join(' vs '));
-    const songs = await Promise.any(
-      fastModels.map(m => makeGeminiRequest(m.name, m.version, vibe, apiKey, excludedSongs, 12000))
-    );
-    console.log(`Fast model race won with ${songs.length} songs`);
-    return songs;
-  } catch (raceErr) {
-    console.warn('Fast model race failed, trying fallback models sequentially:', raceErr);
-  }
-
-  // Phase 2: Sequential fallback
-  let lastError = null;
-  for (const item of fallbackModels) {
-    try {
-      console.log(`Fallback: trying ${item.name} (${item.version})`);
-      const songs = await makeGeminiRequest(item.name, item.version, vibe, apiKey, excludedSongs);
-      return songs;
-    } catch (err) {
-      lastError = err;
-      if (err.message?.includes("API key not valid") || err.message?.includes("API_KEY_INVALID")) {
-        throw err;
-      }
-    }
-  }
-  throw new Error(`All Gemini models failed. Last error: ${lastError?.message || lastError}`);
-}
-
 
 // Verification Log Terminal Writer Helper
 function writeConsoleLog(message, type = 'info') {
@@ -403,11 +309,12 @@ function loadYoutubeVideo(videoId) {
         height: '100%',
         width: '100%',
         videoId: videoId,
-        host: 'https://www.youtube-nocookie.com',
+        host: 'https://www.youtube.com',
         playerVars: {
           'autoplay': 1,
           'enablejsapi': 1,
           'origin': window.location.origin,
+          'widget_referrer': window.location.origin,
           'rel': 0,
           'modestbranding': 1
         },
@@ -690,8 +597,15 @@ async function handleCuration(vibe) {
     const maxAttempts = 4;
     let source = 'gemini';
 
-    if (state.apiKey && state.apiKey.trim()) {
+    if (state.geminiActive) {
       writeConsoleLog("Starting Gemini multi-batch stream harvest…", "header");
+      
+      const memory = getTarangMemory().slice(-5);
+      let vibeWithContext = vibe;
+      if (memory.length > 0) {
+        vibeWithContext += `\n\n[User Command History Context (to learn patterns)]:\n` + 
+          memory.map(c => `- Spoke: "${c.raw}" (Intent: ${c.intent}, Action: ${c.action})`).join('\n');
+      }
       
       while (workingSongs.length < 20 && attempts < maxAttempts) {
         attempts++;
@@ -699,15 +613,31 @@ async function handleCuration(vibe) {
         
         let candidates = [];
         try {
-          candidates = await curateWithGemini(vibe, state.apiKey, excludedSongs);
+          const response = await fetch('/api/curate', {
+            method: 'POST',
+            headers: getHeaders({ 'Content-Type': 'application/json' }),
+            body: JSON.stringify({ vibe: vibeWithContext, excludedSongs })
+          });
+          if (!response.ok) {
+            const errorData = await response.json().catch(() => ({}));
+            throw new Error(errorData.error || `HTTP ${response.status}`);
+          }
+          const data = await response.json();
+          if (data.pipeline) {
+            console.log(`[Tarang] Curation pipeline: ${data.pipeline}`);
+          }
+          if (data.emotion_analysis) {
+            console.log(`[Tarang] Emotion: ${data.emotion_analysis.primary_emotion} | Energy: ${data.emotion_analysis.energy_level} | Intensity: ${data.emotion_analysis.intensity}`);
+          }
+          candidates = data.songs || [];
           writeConsoleLog(`Received ${candidates.length} song recommendations from Gemini.`, "pass");
         } catch (err) {
           console.warn("Gemini curation failed:", err);
           writeConsoleLog(`Gemini API call failed: ${err.message || err}`, "warn");
           
           if (workingSongs.length === 0) {
-            showToast(`Gemini API Error: ${err.message || err}. Using offline demo fallback.`, true);
-            writeConsoleLog("Falling back to local database.", "warn");
+            showToast("Curating playlist using offline catalog...", false);
+            writeConsoleLog("Gemini API unavailable. Falling back to local database.", "warn");
             const fallbackSongs = curateFallback(vibe);
             source = 'mock';
             
@@ -853,52 +783,29 @@ async function handleCuration(vibe) {
     `;
   }
 }
-// Settings Modal Management
-function setupSettingsModal() {
-  const modal = document.getElementById('settings-modal');
-  const openBtn = document.getElementById('open-settings-btn');
-  const closeBtn = document.getElementById('close-settings-btn');
-  const saveBtn = document.getElementById('save-settings-btn');
-  const keyInput = document.getElementById('api-key-input');
-  
-  keyInput.value = state.apiKey;
-  updateKeyBadge(state.apiKey);
-  debugListModels(state.apiKey);
-
-  const openModal = () => {
-    modal.classList.remove('hidden');
-    modal.classList.add('flex');
-    keyInput.value = state.apiKey;
-  };
-
-  const closeModal = () => {
-    modal.classList.add('hidden');
-    modal.classList.remove('flex');
-  };
-
-  openBtn.addEventListener('click', openModal);
-  closeBtn.addEventListener('click', closeModal);
-  
-  modal.addEventListener('click', (e) => {
-    if (e.target === modal) closeModal();
-  });
-
-  saveBtn.addEventListener('click', () => {
-    const rawKey = keyInput.value.trim();
-    state.apiKey = rawKey;
-    localStorage.setItem('gemini_api_key', rawKey);
-    updateKeyBadge(rawKey);
-    closeModal();
-    debugListModels(rawKey);
-    showToast("Settings saved successfully!");
-  });
+// Fetch status on initialization
+async function checkBackendStatus() {
+  try {
+    const response = await fetch('/api/status', {
+      headers: getHeaders()
+    });
+    if (response.ok) {
+      const data = await response.json();
+      state.geminiActive = data.gemini_active;
+      updateKeyBadge(state.geminiActive);
+    } else {
+      updateKeyBadge(false);
+    }
+  } catch (e) {
+    updateKeyBadge(false);
+  }
 }
 
-function updateKeyBadge(key) {
+function updateKeyBadge(geminiActive) {
   const badge = document.getElementById('api-status-badge');
   if (!badge) return;
   badge.classList.remove('hidden');
-  if (key) {
+  if (geminiActive) {
     badge.className = "sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-[var(--font-small)] font-semibold bg-emerald-950/50 border border-emerald-500/25 text-emerald-300";
     badge.innerHTML = `
       <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -941,27 +848,78 @@ function showToast(message, isError = false) {
   }, 5000);
 }
 
-// API Model Listing Helper for debugging
-async function debugListModels(apiKey) {
-  if (!apiKey) return;
-  try {
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
-    if (response.ok) {
-      const data = await response.json();
-      console.log("Gemini API list of available models for this key:", data.models?.map(m => m.name.replace('models/', '')));
-    } else {
-      const err = await response.json().catch(() => ({}));
-      console.warn("Could not list models: ", err.error?.message || response.statusText);
-    }
-  } catch (e) {
-    console.warn("Could not list models due to network/CORS error:", e);
-  }
-}
-
 // App Initialization
 document.addEventListener('DOMContentLoaded', () => {
-  setupSettingsModal();
+  checkBackendStatus();
   renderHistoryChips();
+
+  // Settings Modal handlers
+  const openSettingsBtn = document.getElementById('open-settings-btn');
+  const closeSettingsBtn = document.getElementById('close-settings-btn');
+  const saveSettingsBtn = document.getElementById('save-settings-btn');
+  const settingsModal = document.getElementById('settings-modal');
+  const apiKeyInput = document.getElementById('api-key-input');
+  const voiceEngineSelect = document.getElementById('voice-engine-select');
+
+  if (openSettingsBtn && settingsModal) {
+    openSettingsBtn.addEventListener('click', () => {
+      if (apiKeyInput) {
+        apiKeyInput.value = localStorage.getItem('gemini_api_key') || '';
+      }
+      if (voiceEngineSelect) {
+        voiceEngineSelect.value = localStorage.getItem('tarang_use_backend') === 'true' ? 'backend' : 'browser';
+      }
+      settingsModal.classList.remove('hidden');
+      settingsModal.classList.add('flex');
+    });
+  }
+
+  if (closeSettingsBtn && settingsModal) {
+    closeSettingsBtn.addEventListener('click', () => {
+      settingsModal.classList.add('hidden');
+      settingsModal.classList.remove('flex');
+    });
+  }
+
+  if (settingsModal) {
+    settingsModal.addEventListener('click', (e) => {
+      if (e.target === settingsModal) {
+        settingsModal.classList.add('hidden');
+        settingsModal.classList.remove('flex');
+      }
+    });
+  }
+
+  if (saveSettingsBtn && settingsModal) {
+    saveSettingsBtn.addEventListener('click', () => {
+      const key = apiKeyInput ? apiKeyInput.value.trim() : '';
+      const engine = voiceEngineSelect ? voiceEngineSelect.value : 'browser';
+
+      localStorage.setItem('gemini_api_key', key);
+      localStorage.setItem('tarang_use_backend', engine === 'backend' ? 'true' : 'false');
+      
+      useBackendTranscription = (engine === 'backend');
+
+      settingsModal.classList.add('hidden');
+      settingsModal.classList.remove('flex');
+
+      showToast('Settings saved successfully!');
+      checkBackendStatus();
+      
+      if (tarangActive) {
+        tarangStart();
+      }
+    });
+  }
+
+  // Resume suspended AudioContext on any user click
+  document.body.addEventListener('click', () => {
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().then(() => {
+        console.log('[Tarang] AudioContext resumed successfully via body click.');
+      });
+    }
+  });
 
   const playerPlayBtn = document.getElementById('player-play-btn');
   const playerNextBtn = document.getElementById('player-next-btn');
@@ -1059,6 +1017,7 @@ document.addEventListener('DOMContentLoaded', () => {
 let tarangRecognizer = null;      // The one and only recognizer instance
 let audioCtx = null;
 let analyserNode = null;
+let filteredStreamNode = null;    // Filtered stream for MediaRecorder
 let visualizerFrameId = null;
 let vizStream = null;
 let tarangEnabled = true;          // Is the assistant toggled ON?
@@ -1070,8 +1029,113 @@ let tarangMoodBuffer = '';         // Accumulated mood description from voice
 let tarangSilenceTimer = null;     // 2s silence detector timer
 let tarangNetworkRetryDelay = 200; // Restart delay in ms (backs off on network error)
 
+// Always-On Jarvis FSM state variables
+let tarangFSMState = 'PASSIVE';
+let awakeTimeout = null;
+
+// New 3-state state machine variable
+let tarangState = 'passive';       // 'passive', 'awake', 'executing'
+
+// Memory storage helper functions
+function getTarangMemory() {
+  try {
+    const mem = localStorage.getItem('tarang_command_memory');
+    return mem ? JSON.parse(mem) : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveTarangMemory(raw, intent, action) {
+  try {
+    const memory = getTarangMemory();
+    const entry = {
+      raw: raw,
+      intent: intent,
+      action: action,
+      timestamp: new Date().toISOString()
+    };
+    memory.push(entry);
+    localStorage.setItem('tarang_command_memory', JSON.stringify(memory));
+  } catch (e) {
+    console.error('[Tarang Memory] Error saving:', e);
+  }
+}
+
+function resolveIntentAndAction(text) {
+  const t = text.toLowerCase();
+  
+  // Stop / Pause
+  const stopWords = ['stop', 'pause', 'ruk', 'ruko', 'band', 'bandh', 'band karo', 'bandh karo', 'roko', 'stop music', 'pause music'];
+  if (stopWords.some(w => t.includes(w))) {
+    return { intent: 'pause_music', action: 'pauseVideo' };
+  }
+
+  // Resume / Play
+  const resumeWords = ['resume', 'unpause', 'continue playing', 'play music'];
+  if (resumeWords.some(w => t.includes(w))) {
+    return { intent: 'resume_music', action: 'playVideo' };
+  }
+
+  // Next / Skip
+  const nextWords = ['next', 'next song', 'skip', 'agle', 'agla', 'badlo', 'aagad', 'skip song', 'next track'];
+  if (nextWords.some(w => t.includes(w))) {
+    return { intent: 'next_song', action: 'playNext' };
+  }
+
+  // Random
+  const randomWords = ['random', 'shuffle', 'any song', 'play something', 'koi bhi', 'koi bi'];
+  if (randomWords.some(w => t.includes(w))) {
+    return { intent: 'play_random', action: 'playRandomSong' };
+  }
+
+  // Curate my mood
+  const curateKeywords = [
+    'curate', 'let\'s curate', 'lets curate', 'curate my mood', 'curate my mode', 
+    'suggest songs', 'play songs', 'suggest track', 'find songs', 'get songs', 
+    'songs based on', 'mode description', 'gaane bajao', 'gana bajao', 'gaane sunao', 
+    'music lagao', 'baja do', 'bajao', 'gaane lagao', 'play music', 'suggest music',
+    'curate music', 'curate mode', 'curate mood'
+  ];
+  const matchesCuration = curateKeywords.some(w => t.includes(w)) ||
+                          (t.includes('curate') && (t.includes('mood') || t.includes('mode'))) ||
+                          (t.includes('suggest') && (t.includes('song') || t.includes('music') || t.includes('track') || t.includes('playlist'))) ||
+                          (t.includes('let\'s') && t.includes('curate')) ||
+                          (t.includes('lets') && t.includes('curate'));
+  if (matchesCuration) {
+    return { intent: 'curate_mood', action: 'triggerCurationFromVoice' };
+  }
+
+  // Play specific song
+  const playSpecificMatch = t.match(/^(?:play|baja|laga|sun|sunao|chalao)\s+(.+)$/i);
+  if (playSpecificMatch && playSpecificMatch[1] && playSpecificMatch[1].length > 2) {
+    const songName = playSpecificMatch[1].trim();
+    if (!['music', 'songs', 'song', 'something', 'random', 'shuffle', 'curate', 'my mood'].includes(songName)) {
+      return { intent: 'play_specific_song', action: 'tarangPlaySpecificSong' };
+    }
+  }
+
+  // Sleep / Turn off
+  const offWords = ['goodbye tarang', 'bye tarang', 'stop listening', 'sleep', 'go to sleep', 'so jao', 'bye', 'goodbye'];
+  if (offWords.some(w => t.includes(w))) {
+    return { intent: 'sleep', action: 'returnToPassive' };
+  }
+
+  return { intent: 'unknown', action: 'none' };
+}
+
+// Helper for client-side API key header injection
+function getHeaders(extraHeaders = {}) {
+  const headers = { ...extraHeaders };
+  const key = localStorage.getItem('gemini_api_key');
+  if (key) {
+    headers['X-Gemini-API-Key'] = key;
+  }
+  return headers;
+}
+
 // Gemini Backend Transcription Fallback State
-let useBackendTranscription = false;
+let useBackendTranscription = localStorage.getItem('tarang_use_backend') === 'true';
 let isCommandMode = false;
 let mediaRecorder = null;
 let audioChunks = [];
@@ -1103,382 +1167,609 @@ function unduckMusic() {
 }
 
 // 1. INIT
+// 1. INIT
+// === DOM INITIALIZER ===
 function initTarangWidgetUI() {
-  const savedEnabled = localStorage.getItem('tarang_enabled');
-  tarangEnabled = (savedEnabled !== 'false'); // Default to true
+  const pastCommands = getTarangMemory();
+  console.log(`[Tarang Memory] Loaded ${pastCommands.length} past commands`);
 
-  const toggleEl = document.getElementById('tarang-toggle');
-  if (toggleEl) {
-    toggleEl.checked = tarangEnabled;
-    // Remove previous listeners if any (by replacing toggle node, or just attaching cleanly)
-    toggleEl.addEventListener('change', (e) => {
-      tarangEnabled = e.target.checked;
-      localStorage.setItem('tarang_enabled', tarangEnabled ? 'true' : 'false');
-      if (tarangEnabled) {
-        tarangStart();
-      } else {
-        tarangStop();
-      }
-    });
+  const overlay = document.getElementById('tarang-activate-overlay');
+  const activateBtn = document.getElementById('activate-tarang-btn');
+  const reactivateBtn = document.getElementById('tarang-reactivate-btn');
+
+  if (localStorage.getItem('tarang_activated') === 'true') {
+    if (overlay) overlay.style.display = 'none';
+    if (reactivateBtn) reactivateBtn.classList.remove('hidden');
+    TarangVoiceEngine.start();
+  } else {
+    if (overlay) overlay.style.display = 'flex';
+    if (reactivateBtn) reactivateBtn.classList.add('hidden');
   }
 
-  if (tarangEnabled) {
-    tarangStart();
-  } else {
-    setTarangState('disabled');
+  if (activateBtn) {
+    activateBtn.onclick = () => {
+      localStorage.setItem('tarang_activated', 'true');
+      if (overlay) overlay.style.display = 'none';
+      TarangVoiceEngine.start();
+    };
+  }
+
+  if (reactivateBtn) {
+    reactivateBtn.onclick = (e) => {
+      e.stopPropagation();
+      TarangVoiceEngine.start();
+    };
   }
 }
 
-// 2. MIC BUTTON CLICK
-async function handleTarangMicClick() {
-  if (!tarangEnabled) {
-    showToast('Please enable Tarang Voice Assistant using the toggle switch first.', false);
-    return;
-  }
+// === Tarang Voice Recognition Engine (Single Instance Loop) ===
+const TarangVoiceEngine = {
+  recognition: null,
+  tarangActive: false,
+  tarangSpeaking: false,
+  recognitionIsListening: false,
 
-  if (useBackendTranscription) {
-    if (tarangSpeaking) {
-      if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
-      tarangSpeaking = false;
-      playChime('error');
-      setTarangState('passive_listening');
+  get isSpeaking() {
+    return (typeof speechSynthesis !== 'undefined' && speechSynthesis.speaking) || tarangSpeaking || tarangState === 'executing';
+  },
+
+  init() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.error("[Tarang SpeechRecognition] NOT supported in this browser.");
       return;
-    }
-    
-    if (isRecording) {
-      // User tapped the mic button while recording -> Manual stop!
-      stopRecording();
-      return;
-    }
-    
-    if (state.tarangState === 'waiting_for_curate') {
-      // Command mode
-      isCommandMode = true;
-      playChime('start');
-      setTarangState('listening_mood');
-      const transcriptEl = document.getElementById('tarang-transcript');
-      if (transcriptEl) transcriptEl.textContent = 'Speak command now...';
-      startRecording();
     } else {
-      // Check if mood is already set
-      const moodInput = document.getElementById('mood-input');
-      const hasMood = moodInput && moodInput.value.trim().length > 0;
-      if (hasMood) {
-        isCommandMode = true;
-        playChime('start');
-        setTarangState('listening_mood');
-        const transcriptEl = document.getElementById('tarang-transcript');
-        if (transcriptEl) transcriptEl.textContent = 'Speak command now...';
-        startRecording();
-      } else {
-        triggerWakeUp();
-      }
+      console.log("[Tarang SpeechRecognition] Supported. Browser API:", SpeechRecognition.name || "SpeechRecognition");
     }
-  } else {
-    if (tarangWake) {
-      // Put to sleep
-      tarangWake = false;
-      playChime('error');
-      setTarangState('passive_listening');
-      if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
-      
-      // Restart in passive listening mode
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SR) tarangStartListening(SR);
-    } else {
-      // Wake up
-      triggerWakeUp();
-    }
-  }
-}
 
-// 3. START — Start background passive listening
-async function tarangStart() {
-  const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition && !useBackendTranscription) {
-    console.warn("SpeechRecognition not supported in browser. Switching to backend transcription fallback.");
-    useBackendTranscription = true;
-  }
+    this.recognition = new SpeechRecognition();
+    this.recognition.continuous = false;
+    this.recognition.interimResults = true;
+    this.recognition.lang = 'en-IN';
 
-  tarangEnabled = true;
-  tarangActive = true;
-  tarangWake = false;
-  tarangMoodBuffer = '';
-  setTarangState('passive_listening');
-
-  // Request mic stream for visualizer & recorder
-  try {
-    if (!vizStream) {
-      vizStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true
-        }
-      });
-      startVisualizer(vizStream);
-    }
-  } catch (e) {
-    console.warn('Visualizer mic denied/failed:', e);
-    showToast('Microphone access denied. Please allow mic permissions.', true);
-    tarangStop();
-    return;
-  }
-
-  if (useBackendTranscription) {
-    console.log('[Tarang] Running in Gemini backend transcription fallback mode (Tap-to-Speak).');
-    setTarangState('passive_listening');
-  } else {
-    tarangStartListening(SpeechRecognition);
-  }
-}
-
-// 4. ALWAYS-ON CONTINUOUS RECOGNIZER
-function tarangStartListening(SpeechRecognition) {
-  if (!tarangEnabled || !tarangActive) return;
-  if (tarangSpeaking) return;
-
-  if (useBackendTranscription) {
-    // Branch off and do not initialize standard SpeechRecognition
-    return;
-  }
-
-  if (tarangRecognizer) {
-    try { tarangRecognizer.abort(); } catch(e) {}
-    tarangRecognizer = null;
-  }
-
-  try {
-    tarangRecognizer = new SpeechRecognition();
-    tarangRecognizer.continuous = true;
-    tarangRecognizer.interimResults = true;
-    tarangRecognizer.maxAlternatives = 1;
-    tarangRecognizer.lang = navigator.language || 'en-IN';
-
-    const moodInput = document.getElementById('mood-input');
-    const transcriptEl = document.getElementById('tarang-transcript');
-
-    tarangRecognizer.onstart = () => {
-      if (tarangWake) {
-        if (state.tarangState === 'greeting') {
-          setTarangState('greeting');
-        } else if (state.tarangState === 'listening_mood') {
-          setTarangState('listening_mood');
-        } else {
-          setTarangState('waiting_for_curate');
-        }
-      } else {
-        setTarangState('passive_listening');
-      }
-      console.log('[Tarang] Recognizer started in state:', state.tarangState);
+    this.recognition.onstart = () => {
+      this.recognitionIsListening = true;
+      console.log('[Tarang] Mic LIVE ✓ | SpeechRecognition started');
     };
 
-    tarangRecognizer.onresult = (event) => {
+    this.recognition.onaudiostart = () => console.log('[Tarang SpeechRecognition] Audio capturing started.');
+    this.recognition.onsoundstart = () => console.log('[Tarang SpeechRecognition] Sound detected (microphone receiving audio).');
+    this.recognition.onspeechstart = () => console.log('[Tarang SpeechRecognition] Speech detected.');
+    this.recognition.onspeechend = () => console.log('[Tarang SpeechRecognition] Speech ended.');
+    this.recognition.onsoundend = () => console.log('[Tarang SpeechRecognition] Sound ended.');
+    this.recognition.onaudioend = () => console.log('[Tarang SpeechRecognition] Audio capturing ended.');
+
+    this.recognition.onresult = (event) => {
       let interim = '';
-      let justFinal = '';
-
+      let final = '';
       for (let i = event.resultIndex; i < event.results.length; i++) {
-        const t = event.results[i][0].transcript;
-        if (event.results[i].isFinal) {
-          justFinal += t;
+        const result = event.results[i];
+        const transcript = result[0].transcript;
+        if (result.isFinal) {
+          final += transcript;
         } else {
-          interim += t;
+          interim += transcript;
         }
       }
 
-      // Realtime console acknowledgement of heard speech
-      console.log(`[Tarang Live Speech Heard] Interim: "${interim}" | Final: "${justFinal}"`);
+      const currentSpeech = (final || interim).trim();
+      console.log(`[Tarang SpeechRecognition RESULT] Speech: "${currentSpeech}" (isFinal: ${!!final}) | State: ${tarangState} | SubState: ${tarangState}`);
 
-      // Reset network backoff delay on successful recognition results
-      tarangNetworkRetryDelay = 200;
-
-      // Check for wake words anytime (flexible wake up, stops other tasks)
-      const spoken = (justFinal + ' ' + interim).toLowerCase();
-      const wakeWords = ['tarang', 'taran', 'tarun', 'taranga', 'terang', 'hello assistant', 'hey assistant', 'jarvis', 'wake up', 'wake-up', 'chalu ho', 'chalo'];
-      const heardWakeWord = wakeWords.some(w => spoken.includes(w));
-
-      if (heardWakeWord && !tarangSpeaking && state.tarangState !== 'greeting') {
-        console.log(`[Tarang Jarvis] Continuous Wake word intercepted in spoken text: "${spoken}"`);
-        if (typeof speechSynthesis !== 'undefined') {
-          speechSynthesis.cancel();
+      if (currentSpeech) {
+        const transcriptEl = document.getElementById('tarang-transcript');
+        if (transcriptEl) {
+          transcriptEl.textContent = currentSpeech;
         }
-        triggerWakeUp();
-        return;
+        
+        if (tarangState === 'listening_mood') {
+          const moodInput = document.getElementById('mood-input');
+          if (moodInput) {
+            moodInput.value = currentSpeech;
+            moodInput.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+        }
+
+        if (tarangState === 'awake') {
+          this.resetAwakeTimeout();
+        }
       }
 
-      // Check awake status
-      if (!tarangWake) {
-        // If not awake and no wake word, ignore speech input
-        return;
-      } else {
-        // AWAKE
-        if (state.tarangState === 'listening_mood') {
-          // Live transcribing user's mood
-          const currentSpeech = (justFinal || interim).trim();
-          if (currentSpeech) {
-            // Give live acknowledgement of transcribing
-            const statusEl = document.getElementById('tarang-status');
-            if (statusEl) statusEl.textContent = 'Transcribing mood...';
-            
-            if (transcriptEl) {
-              transcriptEl.textContent = currentSpeech;
-            }
+      if (tarangState === 'passive') {
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const result = event.results[i];
+          const confidence = result[0].confidence;
+          const transcript = result[0].transcript.trim();
+
+          console.log(`[Tarang Passive Analysis] Transcript: "${transcript}" | Confidence: ${confidence.toFixed(2)}`);
+
+          if (confidence < 0.5) {
+            console.log(`[Tarang Passive] Noise filter: Ignored due to low confidence (${confidence.toFixed(2)})`);
+            continue;
+          }
+          if (transcript.length < 3) {
+            console.log(`[Tarang Passive] Noise filter: Ignored due to short length (${transcript.length} chars)`);
+            continue;
           }
 
-          if (justFinal) {
-            // Append final results to mood buffer
-            tarangMoodBuffer = (tarangMoodBuffer + ' ' + justFinal.trim()).trim();
+          const spoken = transcript.toLowerCase();
+          if (spoken.includes('tarang')) {
+            console.log(`[Tarang Passive] Wake word detected in: "${spoken}"`);
+            this.transitionTo('awake');
+            return;
+          }
+        }
+      } else if (tarangState === 'awake') {
+        if (final) {
+          const cleanFinal = final.trim();
+          const isFillerOnly = /^(\s*|um|uh|hmm|\b(um|uh|hmm)\b)+$/i.test(cleanFinal);
+          if (isFillerOnly) {
+            console.log(`[Tarang Awake] Ignored filler speech: "${cleanFinal}"`);
+            return;
+          }
+
+          if (awakeTimeout) {
+            clearTimeout(awakeTimeout);
+            awakeTimeout = null;
+          }
+
+          if (tarangState === 'listening_mood') {
+            const moodInput = document.getElementById('mood-input');
             if (moodInput) {
-              moodInput.value = tarangMoodBuffer;
+              moodInput.value = cleanFinal;
               moodInput.dispatchEvent(new Event('input', { bubbles: true }));
             }
-          }
-
-          // Reset silence timer on any speech input
-          if (tarangSilenceTimer) clearTimeout(tarangSilenceTimer);
-          if (interim.trim() || justFinal.trim() || tarangMoodBuffer.trim()) {
-            tarangSilenceTimer = setTimeout(() => {
-              commitMoodAndStopListening();
-            }, 1200); // 1.2s silence detector
-          }
-        } else if (state.tarangState === 'waiting_for_curate') {
-          if (justFinal) {
-            routeTarangCommand(justFinal.trim().toLowerCase());
+            this.commitMoodHelper(cleanFinal);
+          } else {
+            this.transitionTo('executing', cleanFinal);
           }
         }
       }
     };
 
-    tarangRecognizer.onerror = (event) => {
-      if (event.error === 'no-speech' || event.error === 'aborted') return;
-      console.warn('[Tarang] Recognition error:', event.error);
+    this.recognition.onerror = (event) => {
+      if (event.error === 'no-speech') {
+        // This is completely normal — Chrome times out after silence
+        // Do nothing here. onend will fire and restart automatically.
+        console.log('[Tarang] no-speech timeout — normal, restarting...');
+        return; // Early return, let onend handle restart
+      }
+
+      console.warn('[Tarang SpeechRecognition ERROR] event.error:', event.error);
+      console.warn(`[Tarang SpeechRecognition DIAGNOSTICS] Origin: ${window.location.origin} | Protocol: ${window.location.protocol} | UserAgent: ${navigator.userAgent}`);
       
-      // SWITCH TO BACKEND TRANSCRIPTION ON NETWORK ERROR
       if (event.error === 'network') {
-        console.warn(`[Tarang] Speech recognition network error detected. Switching to Gemini Backend Transcription fallback!`);
-        showToast('Speech recognition network error. Switching to Gemini fallback...', false);
         useBackendTranscription = true;
-        
-        // Stop current recognizer and transition
-        tarangWake = false;
-        if (tarangRecognizer) {
-          try { tarangRecognizer.abort(); } catch(e) {}
-          tarangRecognizer = null;
-        }
-        
-        // Restart in backend fallback mode
-        tarangStart();
+        localStorage.setItem('tarang_use_backend', 'true');
+        console.log('[Tarang] HTTP network limit hit. Switching to backend wake detection loop.');
+        // DO NOT call this.stop() — just restart the passive loop in backend mode
+        setTimeout(() => {
+          if (this.tarangActive) this.startPassiveBackendLoop();
+        }, 300);
         return;
       }
 
-      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-        showToast('Microphone access denied. Please allow mic permissions.', true);
-        tarangStop();
+      if (event.error === 'not-allowed') {
+        this.tarangActive = false;
+        tarangActive = false;
+        const reactivateBtn = document.getElementById('tarang-reactivate-btn');
+        if (reactivateBtn) {
+          reactivateBtn.classList.remove('hidden');
+        }
+        setTarangState('disabled');
+        showToast('Microphone access blocked. Click Reactivate to try again.', true);
       }
     };
 
-    tarangRecognizer.onend = () => {
-      console.log('[Tarang] Recognizer ended. Active:', tarangActive, 'Speaking:', tarangSpeaking);
-      if (tarangEnabled && tarangActive && !tarangSpeaking) {
-        // Use backoff delay if set, otherwise standard 200ms
-        const delay = tarangNetworkRetryDelay;
+    this.recognition.onend = () => {
+      this.recognitionIsListening = false;
+      // Always check live speechSynthesis state, never trust the flag
+      const actuallySpoken = (typeof speechSynthesis !== 'undefined' && speechSynthesis.speaking);
+      console.log(`[Tarang END] state=${tarangState} active=${this.tarangActive} ttsActuallyPlaying=${actuallySpoken}`);
+
+      if (this.tarangActive && !actuallySpoken) {
+        // Reset the speaking flags in case they got stuck
+        this.tarangSpeaking = false;
+        tarangSpeaking = false;
         setTimeout(() => {
-          if (tarangEnabled && tarangActive && !tarangSpeaking) {
-            tarangStartListening(SpeechRecognition);
+          if (this.tarangActive) {
+            console.log('[Tarang] Restarting passive listener...');
+            this.startRecognitionInstance();
           }
-        }, delay);
+        }, 200);
       }
     };
+  },
 
-    tarangRecognizer.start();
+  startRecognitionInstance() {
+    console.log(`[Tarang] startRecognitionInstance called | active=${this.tarangActive} | state=${tarangState} | tts=${speechSynthesis.speaking}`);
+    if (!this.recognition) return;
+    try {
+      this.recognition.start();
+    } catch(e) {
+      if (e.name !== 'InvalidStateError') console.error('[Tarang] start() error:', e);
+    }
+  },
 
-  } catch (err) {
-    console.error('[Tarang] Could not start recognizer:', err);
-    showToast('Could not start microphone. Check permissions.', true);
-    tarangStop();
+  startPassiveBackendLoop() {
+    // Passive wake word detection using short audio snapshots sent to Gemini transcribe
+    if (!this.tarangActive || tarangState !== 'passive') return;
+    if (this._passiveLoopRunning) return;
+    this._passiveLoopRunning = true;
+    console.log('[Tarang Passive Backend] Starting wake word detection loop...');
+    this._runPassiveSnapshot();
+  },
+
+  async _runPassiveSnapshot() {
+    if (!this.tarangActive || tarangState !== 'passive') {
+      this._passiveLoopRunning = false;
+      return;
+    }
+
+    try {
+      // Duck music volume during passive snapshot to prevent hearing YouTube audio
+      if (ytPlayer && typeof ytPlayer.setVolume === 'function') {
+        try { ytPlayer.setVolume(5); } catch(e) {}
+      }
+
+      // Record a 4-second audio snapshot
+      const blob = await this._recordSnapshot(4000);
+
+      // Restore volume after snapshot
+      if (ytPlayer && typeof ytPlayer.setVolume === 'function') {
+        try { ytPlayer.setVolume(originalPlayerVolume || 80); } catch(e) {}
+      }
+
+      if (!blob || blob.size < 2000) {
+        // Too small = silence, skip transcription cost, just loop again
+        setTimeout(() => this._runPassiveSnapshot(), 200);
+        return;
+      }
+
+      // Only send to transcribe if average volume suggests someone spoke
+      // (reuse analyserNode if available)
+      const base64 = await blobToBase64(blob);
+      const headers = getHeaders({ 'Content-Type': 'application/json' });
+      const response = await fetch('/api/transcribe', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ audio: base64, mimeType: blob.type || 'audio/webm' })
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        const transcript = (data.transcript || '').toLowerCase().trim();
+        console.log(`[Tarang Passive Backend] Heard: "${transcript}"`);
+
+        // Ignore if transcript looks like song lyrics or timestamps
+        const looksLikeSongLyric = (
+          transcript.length > 40 ||  // long phrases are likely lyrics
+          /^\d+:\d+$/.test(transcript) ||  // timestamps like "00:00"
+          /[àáâãäåæçèéêëìíîïðñòóôõöøùúûüý]/i.test(transcript) || // foreign chars
+          /[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]/i.test(transcript) // Chinese/Japanese
+        );
+        if (looksLikeSongLyric) {
+          console.log(`[Tarang Passive] Ignored likely lyric/noise: "${transcript}"`);
+          setTimeout(() => this._runPassiveSnapshot(), 500);
+          return;
+        }
+
+        // Check for wake word
+        const wakeWords = [
+          // English / Romanized variations
+          'tarang', 'trang', 'hey tarang', 'ok tarang', 'okay tarang',
+          'hi tarang', 'hello tarang', 'aye tarang', 'tarung', 'taarang',
+          'taran', 'tarun', 'taran g', 'ta rang', 'hey trang',
+          // Hindi script variations
+          'तरंग', 'तरंग,', 'हे तरंग', 'ओके तरंग', 'हाय तरंग',
+          'अरे तरंग', 'तरण', 'तरन', 'ટરંગ',
+          // Gujarati script variations  
+          'તરંગ', 'હે તરંગ', 'ઓકે તરંગ', 'હાય તરંગ', 'અરે તરંગ',
+          // Common Gemini mishearings of "Tarang"
+          'trung', 'tron', 'terrain', 'toronto', 'taronga', 'during',
+          'caring', 'daring', 'sharing', 'bearing', 'wearing', 'parang',
+          'carang', 'karang', 'narang', 'darang'
+        ];
+
+        const wakeDetected = wakeWords.some(w => transcript.includes(w));
+
+        if (wakeDetected) {
+          console.log('[Tarang Passive Backend] Wake word detected!');
+          this._passiveLoopRunning = false;
+          this.transitionTo('awake');
+          return;
+        }
+      }
+    } catch(e) {
+      console.warn('[Tarang Passive Backend] Snapshot error:', e.message);
+    }
+
+    // Loop again after short pause
+    setTimeout(() => this._runPassiveSnapshot(), 500);
+  },
+
+  async _recordSnapshot(durationMs) {
+    return new Promise((resolve) => {
+      if (!vizStream) { resolve(null); return; }
+      const chunks = [];
+      let recorder;
+      try {
+        recorder = new MediaRecorder(vizStream);
+      } catch(e) { resolve(null); return; }
+
+      recorder.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+      recorder.onstop = () => resolve(new Blob(chunks, { type: recorder.mimeType }));
+      recorder.start();
+      setTimeout(() => { try { recorder.stop(); } catch(e) { resolve(null); } }, durationMs);
+    });
+  },
+
+  async start() {
+    this.tarangActive = true;
+    tarangActive = true;
+    this.tarangSpeaking = false;
+    
+    if (audioCtx && audioCtx.state === 'suspended') {
+      try {
+        await audioCtx.resume();
+      } catch (e) {
+        console.warn('Failed to resume AudioContext:', e);
+      }
+    }
+
+    if (!this.recognition) {
+      this.init();
+    }
+
+    this.transitionTo('passive');
+    
+    try {
+      if (!vizStream) {
+        vizStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+        startVisualizer(vizStream);
+      }
+    } catch (e) {
+      if (e.name === 'NotAllowedError') {
+        console.log('[Tarang] Microphone access denied by the user.');
+      } else {
+        console.log('[Tarang] Visualizer mic denied/failed:', e);
+      }
+      showToast('Microphone access denied. Please allow mic permissions.', true);
+      this.stop();
+      return;
+    }
+
+    if (!useBackendTranscription) {
+      this.startRecognitionInstance();
+    } else {
+      console.log('[Tarang] Running in Gemini backend transcription fallback mode.');
+      setTarangState('passive');
+    }
+  },
+
+  stop() {
+    this.tarangActive = false;
+    tarangActive = false;
+    this.tarangSpeaking = false;
+    tarangSpeaking = false;
+    tarangWake = false;
+    tarangEnabled = false;
+    
+    if (awakeTimeout) {
+      clearTimeout(awakeTimeout);
+      awakeTimeout = null;
+    }
+
+    if (this.recognition) {
+      try { this.recognition.abort(); } catch (e) {}
+    }
+
+    if (isRecording) {
+      stopRecording();
+    }
+
+    const toggleEl = document.getElementById('tarang-toggle');
+    if (toggleEl) {
+      toggleEl.checked = false;
+    }
+    localStorage.setItem('tarang_enabled', 'false');
+
+    if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
+
+    stopVisualizer();
+    if (vizStream) {
+      vizStream.getTracks().forEach(t => t.stop());
+      vizStream = null;
+    }
+
+    setTarangState('disabled');
+    playChime('error');
+    console.log('[Tarang] Stopped.');
+  },
+
+  async transitionTo(newState, data) {
+    console.log(`[Tarang FSM] Transitioning to state: ${newState}`);
+    tarangState = newState;
+
+    if (newState === 'passive') {
+      if (awakeTimeout) {
+        clearTimeout(awakeTimeout);
+        awakeTimeout = null;
+      }
+      if (this.recognition) {
+        try { this.recognition.abort(); } catch (e) {}
+      }
+      
+      unduckMusic();
+      setTarangState('passive');
+      
+      const transcriptEl = document.getElementById('tarang-transcript');
+      if (transcriptEl) transcriptEl.textContent = 'Ready to listen';
+
+      if (this.tarangActive && !this.isSpeaking) {
+        if (useBackendTranscription) {
+          this.startPassiveBackendLoop();
+        } else {
+          this.startRecognitionInstance();
+        }
+      }
+    } else if (newState === 'awake') {
+      if (awakeTimeout) {
+        clearTimeout(awakeTimeout);
+        awakeTimeout = null;
+      }
+      if (this.recognition) {
+        try { this.recognition.abort(); } catch (e) {}
+      }
+
+      setTarangState('awake');
+      playChime('start');
+      duckMusic();
+
+      const transcriptEl = document.getElementById('tarang-transcript');
+      if (transcriptEl) transcriptEl.textContent = 'Listening for command...';
+
+      this.tarangSpeaking = true;
+      tarangSpeaking = true;
+      await tarangSpeak("Yes, how can I help you?", "en");
+      this.tarangSpeaking = false;
+      tarangSpeaking = false;
+
+      if (tarangState !== 'awake') return;
+
+      if (useBackendTranscription) {
+        isCommandMode = true;
+        startRecording();
+      } else {
+        this.startRecognitionInstance();
+        this.resetAwakeTimeout();
+      }
+    } else if (newState === 'executing') {
+      if (awakeTimeout) {
+        clearTimeout(awakeTimeout);
+        awakeTimeout = null;
+      }
+      
+      setTarangState('executing');
+
+      if (this.recognition) {
+        try { this.recognition.abort(); } catch (e) {}
+      }
+
+      const command = data;
+      const resolved = resolveIntentAndAction(command);
+      saveTarangMemory(command, resolved.intent, resolved.action);
+
+      routeTarangCommand(command);
+    }
+  },
+
+  resetAwakeTimeout() {
+    if (awakeTimeout) clearTimeout(awakeTimeout);
+    awakeTimeout = setTimeout(async () => {
+      console.log('[Tarang Awake] Silence timeout reached.');
+      if (tarangState === 'awake') {
+        this.tarangSpeaking = true;
+        tarangSpeaking = true;
+        if (this.recognition) {
+          try { this.recognition.abort(); } catch (e) {}
+        }
+        await tarangSpeak("Going back to sleep", "en");
+        this.tarangSpeaking = false;
+        tarangSpeaking = false;
+        this.transitionTo('passive');
+      }
+    }, 8000);
+  },
+
+  async commitMoodHelper(finalMood) {
+    this.tarangSpeaking = true;
+    tarangSpeaking = true;
+    if (this.recognition) {
+      try { this.recognition.abort(); } catch(e) {}
+    }
+
+    playChime('success');
+    setTarangState('waiting_for_curate');
+
+    tarangDetectedLang = detectTextLanguage(finalMood);
+
+    let ackText = "I've noted your mood. You can verify it and say 'Curate my mood' when ready.";
+    if (tarangDetectedLang === 'hi') {
+      ackText = "मैंने आपका मूड नोट कर लिया है। आप 'क्यूरेट माय मूड' बोलकर संगीत शुरू कर सकते हैं।";
+    } else if (tarangDetectedLang === 'gu') {
+      ackText = "મેં તમારો મૂડ નોંધી લીધો છે. તમે 'ક્યુરેટ માય મૂડ' બોલીને સંગીત શરૂ કરી શકો છો.";
+    }
+
+    const transcriptEl = document.getElementById('tarang-transcript');
+    if (transcriptEl) {
+      transcriptEl.textContent = finalMood || "Mood captured";
+    }
+
+    await tarangSpeak(ackText, tarangDetectedLang);
+    this.tarangSpeaking = false;
+    tarangSpeaking = false;
+    unduckMusic();
+
+    if (useBackendTranscription) {
+      isCommandMode = true;
+      startRecording();
+    } else {
+      this.transitionTo('awake');
+    }
   }
+};
+
+// === FSM Bridge & Wrappers ===
+function transitionToAwake() {
+  TarangVoiceEngine.transitionTo('awake');
 }
 
-// 5. TRIGGER WAKE UP
-async function triggerWakeUp() {
-  tarangWake = true;
-  tarangMoodBuffer = '';
-  
-  if (tarangRecognizer) {
-    try { tarangRecognizer.abort(); } catch(e) {}
-    tarangRecognizer = null;
+function returnToPassive() {
+  TarangVoiceEngine.transitionTo('passive');
+}
+
+function transitionToExecuting(command) {
+  TarangVoiceEngine.transitionTo('executing', command);
+}
+
+async function handleTarangMicClick() {
+  if (audioCtx && audioCtx.state === 'suspended') {
+    try {
+      await audioCtx.resume();
+    } catch (e) {}
   }
-  
-  setTarangState('greeting');
-  playChime('start');
-  duckMusic();
-  
-  await tarangSpeak("Hello Sir, please tell me your mood right now.", 'en');
-  if (!tarangEnabled || !tarangWake) return; // check if stopped/cancelled
-  
-  // Clear any existing mood in field
-  const moodInput = document.getElementById('mood-input');
-  if (moodInput) {
-    moodInput.value = '';
-    moodInput.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-  const transcriptEl = document.getElementById('tarang-transcript');
-  if (transcriptEl) transcriptEl.textContent = 'Speak your mood now';
-  
-  setTarangState('listening_mood');
-  
-  if (useBackendTranscription) {
-    startRecording();
+
+  if (!TarangVoiceEngine.tarangActive) {
+    console.log('[Tarang] Restarting voice pipeline...');
+    TarangVoiceEngine.start();
   } else {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (SR) tarangStartListening(SR);
+    if (tarangState === 'passive') {
+      TarangVoiceEngine.transitionTo('awake');
+    } else {
+      TarangVoiceEngine.transitionTo('passive');
+    }
   }
 }
 
-// 6. COMMIT MOOD ONCE USER STOPS SPEAKING (SILENCE DETECTED)
-async function commitMoodAndStopListening() {
-  if (tarangSilenceTimer) clearTimeout(tarangSilenceTimer);
-  tarangSilenceTimer = null;
+function tarangStart() {
+  TarangVoiceEngine.start();
+}
 
-  tarangSpeaking = true;
-  if (tarangRecognizer) {
-    try { tarangRecognizer.abort(); } catch(e) {}
-    tarangRecognizer = null;
-  }
-
-  playChime('success');
-  setTarangState('waiting_for_curate');
-
-  const moodInput = document.getElementById('mood-input');
-  const finalMood = moodInput ? moodInput.value.trim() : '';
-  tarangDetectedLang = detectTextLanguage(finalMood);
-
-  let ackText = "I've noted your mood. You can verify it and say 'Curate my mood' when ready.";
-  if (tarangDetectedLang === 'hi') {
-    ackText = "मैंने आपका मूड नोट कर लिया है। आप 'क्यूरेट माय मूड' बोलकर संगीत शुरू कर सकते हैं।";
-  } else if (tarangDetectedLang === 'gu') {
-    ackText = "મેં તમારો મૂડ નોંધી લીધો છે. તમે 'ક્યુરેટ માય મૂડ' બોલીને સંગીત શરૂ કરી શકો છો.";
-  }
-
-  const transcriptEl = document.getElementById('tarang-transcript');
-  if (transcriptEl) {
-    transcriptEl.textContent = finalMood || "Mood captured";
-  }
-
-  await tarangSpeak(ackText, tarangDetectedLang);
-  tarangSpeaking = false;
-  unduckMusic();
-
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (SR && tarangEnabled && tarangWake) {
-    tarangStartListening(SR);
-  }
+function tarangStartListening() {
+  TarangVoiceEngine.startRecognitionInstance();
 }
 
 // 6b. BACKEND RECORDING FUNCTIONS (FALLBACK MODE)
 // Start MediaRecorder recording
 function startRecording() {
-  if (!vizStream) {
+  const recordStream = (filteredStreamNode && filteredStreamNode.stream) ? filteredStreamNode.stream : vizStream;
+  if (!recordStream) {
     console.warn("No mic stream available for recording.");
     return;
   }
@@ -1493,7 +1784,12 @@ function startRecording() {
       options = {}; // fallback to default
     }
     
-    mediaRecorder = new MediaRecorder(vizStream, options);
+    try {
+      mediaRecorder = new MediaRecorder(recordStream, options);
+    } catch (e) {
+      console.warn('[Tarang] Failed to record from filtered stream, falling back to raw mic stream:', e);
+      mediaRecorder = new MediaRecorder(vizStream, options);
+    }
     
     mediaRecorder.ondataavailable = (event) => {
       if (event.data && event.data.size > 0) {
@@ -1545,11 +1841,11 @@ function stopRecording() {
 function uploadAndTranscribe(audioBlob, mimeType) {
   setTarangState('processing');
   
-  if (!state.apiKey) {
-    showToast("Please set your Gemini API key in settings to use voice transcription.", true);
+  if (!state.geminiActive) {
+    showToast("Gemini Voice Curation is not configured on the backend.", true);
     playChime('error');
     setTarangState('passive_listening');
-    tarangSpeak("Please configure your Gemini API key in settings to enable this feature.", 'en');
+    tarangSpeak("Please configure the Gemini API key on the backend to enable this feature.", 'en');
     isCommandMode = false;
     return;
   }
@@ -1562,17 +1858,16 @@ function uploadAndTranscribe(audioBlob, mimeType) {
       
       const requestPayload = {
         audio: base64data,
-        mimeType: mimeType,
-        apiKey: state.apiKey
+        mimeType: mimeType
       };
       
       if (isCommandMode) {
         console.log("[Tarang] Sending audio to /api/transcribe...");
         const response = await fetch('/api/transcribe', {
           method: 'POST',
-          headers: {
+          headers: getHeaders({
             'Content-Type': 'application/json'
-          },
+          }),
           body: JSON.stringify(requestPayload)
         });
         
@@ -1599,9 +1894,9 @@ function uploadAndTranscribe(audioBlob, mimeType) {
         console.log("[Tarang] Sending audio to /api/voice-curate...");
         const response = await fetch('/api/voice-curate', {
           method: 'POST',
-          headers: {
+          headers: getHeaders({
             'Content-Type': 'application/json'
-          },
+          }),
           body: JSON.stringify(requestPayload)
         });
         
@@ -1651,13 +1946,24 @@ function uploadAndTranscribe(audioBlob, mimeType) {
         }
       }
     } catch (err) {
-      console.error("[Tarang Voice Pipeline] Failure:", err);
-      showToast("Voice curation failed: " + (err.message || err), true);
-      playChime('error');
-      setTarangState('passive_listening');
-      await tarangSpeak("Sorry, there was an error processing your voice input. Please try again.", 'en');
-      isCommandMode = false;
+      console.warn("[Tarang Voice Pipeline] Backend failed, falling back gracefully to local database:", err);
+      showToast("Optimizing playlist from offline database...", false);
+      
+      playChime('success');
+      setTarangState('greeting');
+      
+      const transcriptEl = document.getElementById('tarang-transcript');
+      if (transcriptEl) {
+        transcriptEl.textContent = "Offline Vibe Curation";
+      }
+      
+      await tarangSpeak("Curating from the offline database for you.", 'en');
+      tarangSpeaking = false;
       unduckMusic();
+      
+      const fallbackSongs = curateFallback("Happy Hindi Songs");
+      isCommandMode = false;
+      await verifyAndPlayVoiceCuration(fallbackSongs, "Happy Hindi Songs");
     }
   };
 }
@@ -1697,14 +2003,17 @@ async function verifyAndPlayVoiceCuration(candidates, vibe) {
   try {
     const workingSongs = [];
     
-    // Verify candidates batch-by-batch
-    const BATCH_SIZE = 5;
-    for (let i = 0; i < candidates.length; i += BATCH_SIZE) {
-      if (workingSongs.length >= 20) break;
+    // Replace parallel search loop with throttled batch loop (Fix 1)
+    const songs = candidates;
+    const BATCH_SIZE = 3;
+    const DELAY_BETWEEN_BATCHES = 7000; // 7 seconds between batches of 3
+
+    for (let i = 0; i < songs.length; i += BATCH_SIZE) {
+      if (workingSongs.length >= 10) break;
       
-      const batch = candidates.slice(i, i + BATCH_SIZE);
+      const batch = songs.slice(i, i + BATCH_SIZE);
       const batchPromises = batch.map(async (song) => {
-        if (workingSongs.length >= 20) return;
+        if (workingSongs.length >= 10) return;
         
         const trackId = `"${song.title}"`;
         try {
@@ -1714,18 +2023,10 @@ async function verifyAndPlayVoiceCuration(candidates, vibe) {
           const response = await fetch(`/api/search?q=${encodeURIComponent(query)}`);
           if (response.ok) {
             const data = await response.json();
-            if (data.candidates && data.candidates.length > 0) {
-              data.candidates.forEach((cand, cIdx) => {
-                const status = cand.ok 
-                  ? "PLAYABLE" 
-                  : `UNPLAYABLE (${cand.status}${cand.reason ? ': ' + cand.reason : ''})`;
-                writeConsoleLog(`  [Cand ${cIdx+1}] ${cand.videoId} → ${status}`, cand.ok ? "pass" : "fail");
-              });
-            }
             if (data.videoId) {
               song.videoId = data.videoId;
               workingSongs.push(song);
-              writeConsoleLog(`✓ [${workingSongs.length}/20] ${trackId} → ${data.videoId}`, "pass");
+              writeConsoleLog(`✓ [${workingSongs.length}/10] ${trackId} → ${data.videoId}`, "pass");
               if (buttonText) buttonText.textContent = `Verified ${workingSongs.length} songs…`;
             } else {
               song.videoId = null;
@@ -1740,7 +2041,12 @@ async function verifyAndPlayVoiceCuration(candidates, vibe) {
           writeConsoleLog(`✗ ${trackId} — network error: ${err.message}`, "fail");
         }
       });
+      
       await Promise.all(batchPromises);
+      
+      if (workingSongs.length < 10 && i + BATCH_SIZE < songs.length) {
+        await new Promise(resolve => setTimeout(resolve, DELAY_BETWEEN_BATCHES));
+      }
     }
     
     const finalPlaylist = workingSongs.slice(0, 20);
@@ -1757,6 +2063,19 @@ async function verifyAndPlayVoiceCuration(candidates, vibe) {
     
     writeConsoleLog("Voice curation complete. Launching playback.", "info");
     playRandomSong();
+
+    // After curation, stay in command mode — user should be able to give commands immediately
+    tarangState = 'awake';
+    setTarangState('awake');
+    TarangVoiceEngine.tarangSpeaking = false;
+    tarangSpeaking = false;
+    // Restart command recording immediately
+    if (TarangVoiceEngine.tarangActive) {
+      setTimeout(() => {
+        startRecording();
+        console.log('[Tarang] Staying in command mode after curation.');
+      }, 500);
+    }
     
   } catch (error) {
     console.error("Voice curation validation error:", error);
@@ -1883,8 +2202,13 @@ function routeTarangCommand(text) {
 
   // Treat anything else as addition to mood description if they are in passive/command state and say something
   const statusEl = document.getElementById('tarang-status');
-  if (statusEl && state.tarangState === 'waiting_for_curate') {
-    statusEl.textContent = 'Say "Curate my mood"';
+  if (tarangState === 'waiting_for_curate') {
+    if (statusEl) statusEl.textContent = 'Say "Curate my mood"';
+    setTarangState('waiting_for_curate');
+    tarangStartListening();
+  } else {
+    // For other states (like 'awake'), if command is unknown, go back to passive listening
+    returnToPassive();
   }
 }
 
@@ -1921,8 +2245,7 @@ async function tarangPlaySpecificSong(songName) {
       if (useBackendTranscription) {
         setTarangState('waiting_for_curate');
       } else {
-        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-        if (SR) tarangStartListening(SR);
+        returnToPassive();
       }
     }
   }
@@ -1942,8 +2265,7 @@ async function tarangRespondAndListen(text, lang) {
     if (useBackendTranscription) {
       setTarangState('waiting_for_curate');
     } else {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      if (SR) tarangStartListening(SR);
+      returnToPassive();
     }
   }
 }
@@ -1983,42 +2305,7 @@ function tarangSpeak(text, langCode) {
 
 // 11. STOP THE ASSISTANT COMPLETELY
 function tarangStop() {
-  tarangActive = false;
-  tarangWake = false;
-  tarangSpeaking = false;
-  tarangEnabled = false;
-
-  if (isRecording) {
-    stopRecording();
-  }
-
-  const toggleEl = document.getElementById('tarang-toggle');
-  if (toggleEl) {
-    toggleEl.checked = false;
-  }
-  localStorage.setItem('tarang_enabled', 'false');
-  
-  if (tarangSilenceTimer) {
-    clearTimeout(tarangSilenceTimer);
-    tarangSilenceTimer = null;
-  }
-
-  if (tarangRecognizer) {
-    try { tarangRecognizer.abort(); } catch(e) {}
-    tarangRecognizer = null;
-  }
-
-  if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
-
-  stopVisualizer();
-  if (vizStream) {
-    vizStream.getTracks().forEach(t => t.stop());
-    vizStream = null;
-  }
-
-  setTarangState('disabled');
-  playChime('error');
-  console.log('[Tarang] Stopped.');
+  TarangVoiceEngine.stop();
 }
 
 // 12. TRIGGER CURATION FROM VOICE
@@ -2045,6 +2332,18 @@ async function triggerCurationFromVoice() {
   tarangSpeaking = false;
 
   setTarangState('idle');
+  // After curation, stay in command mode — user should be able to give commands immediately
+  tarangState = 'awake';
+  setTarangState('awake');
+  TarangVoiceEngine.tarangSpeaking = false;
+  tarangSpeaking = false;
+  // Restart command recording immediately
+  if (TarangVoiceEngine.tarangActive) {
+    setTimeout(() => {
+      startRecording();
+      console.log('[Tarang] Staying in command mode after curation.');
+    }, 500);
+  }
   handleCuration(moodText);
 }
 
@@ -2071,67 +2370,61 @@ function setTarangState(stateName) {
   if (bars) bars.classList.add('hidden');
   widget.classList.remove('disabled');
 
-  if (stateName === 'disabled') {
+  // Map stateName to FSM states
+  let fsmState = 'PASSIVE';
+  if (['awake', 'listening_mood', 'waiting_for_curate'].includes(stateName)) {
+    fsmState = 'AWAKE';
+  } else if (['executing', 'greeting', 'processing', 'idle'].includes(stateName)) {
+    fsmState = 'EXECUTING';
+  } else if (stateName === 'disabled') {
+    fsmState = 'DISABLED';
+  }
+
+  // Set the FSM global state variable
+  if (fsmState !== 'DISABLED') {
+    tarangFSMState = fsmState;
+  }
+
+  // Remove FSM CSS classes
+  micContainer.classList.remove('tarang-passive', 'tarang-awake', 'tarang-executing', 'siri-pulse-active');
+
+  if (fsmState === 'PASSIVE') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-zinc-500 border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC}`;
+    micContainer.classList.add('tarang-passive');
+    if (micIcon) micIcon.className = 'h-6 w-6 text-purple-400 relative z-10 transition-colors duration-300';
+    statusEl.textContent = '👂 Passive';
+  } else if (fsmState === 'AWAKE') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-emerald-500 border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC}`;
+    micContainer.classList.add('tarang-awake');
+    if (micIcon) micIcon.className = 'h-6 w-6 text-emerald-300 relative z-10 transition-colors duration-300';
+    if (bars) bars.classList.remove('hidden');
+    if (stateName === 'listening_mood') {
+      statusEl.textContent = '🎤 Describe Mood';
+    } else if (stateName === 'waiting_for_curate') {
+      statusEl.textContent = '💬 Confirm Mood';
+    } else {
+      statusEl.textContent = '🔊 Awake';
+    }
+  } else if (fsmState === 'EXECUTING') {
+    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-orange-500 border-2 border-[#06050b] transition-all duration-300';
+    micContainer.className = `${BASE_MIC}`;
+    micContainer.classList.add('tarang-executing');
+    if (micIcon) micIcon.className = 'h-6 w-6 text-orange-400 relative z-10 transition-colors duration-300';
+    if (stateName === 'processing') {
+      statusEl.textContent = '⏳ Processing...';
+    } else if (stateName === 'greeting') {
+      statusEl.textContent = '🗣️ Speaking';
+    } else {
+      statusEl.textContent = '⚡ Executing';
+    }
+  } else if (fsmState === 'DISABLED') {
     widget.classList.add('disabled');
-    const toggleEl = document.getElementById('tarang-toggle');
-    if (toggleEl) toggleEl.checked = false;
     dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-zinc-600 border-2 border-[#06050b] transition-all duration-300';
     micContainer.className = `${BASE_MIC} bg-zinc-950/20 border-zinc-800/30 cursor-not-allowed`;
     if (micIcon) micIcon.className = 'h-6 w-6 text-zinc-600 relative z-10 transition-colors duration-300';
-    micContainer.classList.remove('siri-pulse-active');
     statusEl.textContent = 'Assistant Disabled';
-    transcriptEl.textContent = 'Turn on toggle switch';
-
-  } else if (stateName === 'passive_listening') {
-    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-purple-500 border-2 border-[#06050b] transition-all duration-300';
-    micContainer.className = `${BASE_MIC} bg-purple-950/40 border-purple-500/20`;
-    if (micIcon) micIcon.className = 'h-6 w-6 text-purple-400 relative z-10 transition-colors duration-300';
-    micContainer.classList.remove('siri-pulse-active');
-    statusEl.textContent = useBackendTranscription ? 'Assistant Active' : 'Listening for "Hey Tarang"...';
-    transcriptEl.textContent = useBackendTranscription ? 'Click mic button to speak' : 'Say "Hey Tarang" or click mic';
-
-  } else if (stateName === 'greeting') {
-    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-blue-400 animate-pulse border-2 border-[#06050b] transition-all duration-300';
-    micContainer.className = `${BASE_MIC} bg-blue-950/40 border-blue-500/40`;
-    if (micIcon) micIcon.className = 'h-6 w-6 text-blue-300 relative z-10 transition-colors duration-300';
-    micContainer.classList.remove('siri-pulse-active');
-    statusEl.textContent = 'Tarang is speaking…';
-    if (useBackendTranscription) transcriptEl.textContent = 'Speaking...';
-
-  } else if (stateName === 'listening_mood') {
-    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-emerald-400 animate-pulse border-2 border-[#06050b] transition-all duration-300';
-    micContainer.className = `${BASE_MIC} bg-emerald-950/40 border-emerald-500/45 siri-pulse-active`;
-    if (micIcon) micIcon.className = 'h-6 w-6 text-emerald-300 relative z-10 transition-colors duration-300';
-    if (bars) bars.classList.remove('hidden');
-    statusEl.textContent = isCommandMode ? 'Listening for command...' : 'Listening for mood...';
-    if (!tarangMoodBuffer) {
-      transcriptEl.textContent = isCommandMode ? 'Speak your command now' : 'Speak your mood now';
-    }
-
-  } else if (stateName === 'waiting_for_curate') {
-    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-violet-400 animate-pulse border-2 border-[#06050b] transition-all duration-300';
-    micContainer.className = `${BASE_MIC} bg-purple-950/50 border-purple-500/35`;
-    if (micIcon) micIcon.className = 'h-6 w-6 text-violet-300 relative z-10 transition-colors duration-300';
-    micContainer.classList.remove('siri-pulse-active');
-    statusEl.textContent = useBackendTranscription ? 'Click mic to say command' : 'Say "Curate my mood"';
-    if (useBackendTranscription) {
-      transcriptEl.textContent = 'Say "Curate my mood" or other commands';
-    }
-
-  } else if (stateName === 'processing') {
-    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-amber-400 animate-ping border-2 border-[#06050b] transition-all duration-300';
-    micContainer.className = `${BASE_MIC} bg-amber-950/40 border-amber-500/40`;
-    if (micIcon) micIcon.className = 'h-6 w-6 text-amber-300 relative z-10 transition-colors duration-300';
-    micContainer.classList.remove('siri-pulse-active');
-    statusEl.textContent = 'Processing…';
-    transcriptEl.textContent = 'Working on it';
-
-  } else if (stateName === 'idle') {
-    dotEl.className = 'absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-purple-500 border-2 border-[#06050b] transition-all duration-300';
-    micContainer.className = `${BASE_MIC} bg-purple-950/50 border-purple-500/30`;
-    if (micIcon) micIcon.className = 'h-6 w-6 text-purple-300 relative z-10 transition-colors duration-300';
-    micContainer.classList.remove('siri-pulse-active');
-    statusEl.textContent = 'Ready';
   }
 }
 
@@ -2183,9 +2476,33 @@ function startVisualizer(stream) {
 
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   const source = audioCtx.createMediaStreamSource(stream);
+
+  // 120Hz highpass filter to reject background hums/noises below vocal range
+  const highpassFilter = audioCtx.createBiquadFilter();
+  highpassFilter.type = 'highpass';
+  highpassFilter.frequency.setValueAtTime(120, audioCtx.currentTime);
+
+  // 3000Hz lowpass filter to reject high-frequency static/hiss
+  const lowpassFilter = audioCtx.createBiquadFilter();
+  lowpassFilter.type = 'lowpass';
+  lowpassFilter.frequency.setValueAtTime(3000, audioCtx.currentTime);
+
   analyserNode = audioCtx.createAnalyser();
   analyserNode.fftSize = 64;
-  source.connect(analyserNode);
+
+  // Connect Web Audio chain: source -> highpass -> lowpass -> analyser
+  source.connect(highpassFilter);
+  highpassFilter.connect(lowpassFilter);
+  lowpassFilter.connect(analyserNode);
+
+  // Connect filtered audio to a MediaStream destination for recording
+  try {
+    filteredStreamNode = audioCtx.createMediaStreamDestination();
+    lowpassFilter.connect(filteredStreamNode);
+  } catch (e) {
+    console.warn('[Tarang] Failed to create filtered MediaStream destination:', e);
+    filteredStreamNode = null;
+  }
 
   const bufferLength = analyserNode.frequencyBinCount;
   const dataArray = new Uint8Array(bufferLength);
@@ -2206,27 +2523,28 @@ function startVisualizer(stream) {
       
       // Let's log levels occasionally for debugging
       if (Math.random() < 0.05) {
-        console.log(`[Tarang Live Audio Level] Volume: ${averageVolume.toFixed(2)} | Speech Detected: ${averageVolume > 12}`);
+        console.log(`[Tarang Live Audio Level] Volume: ${averageVolume.toFixed(2)} | Speech Detected: ${averageVolume > 25}`);
       }
 
-      if (averageVolume > 12) {
+      if (averageVolume > 25) {
         if (!hasUserSpoken) {
           hasUserSpoken = true;
-          console.log("[Tarang Silence Detection] Speech started.");
+          console.log("[Tarang Silence Detection] Speech started. Volume:", averageVolume.toFixed(2));
         }
         lastSpeechTime = Date.now();
       } else {
         const elapsedSinceStart = Date.now() - lastSpeechTime;
         if (!hasUserSpoken) {
-          // If the user hasn't spoken at all, auto-stop after 4 seconds of silence
-          if (elapsedSinceStart > 4000) {
-            console.log("[Tarang Silence Detection] No speech detected for 4s. Auto-stopping.");
+          // If the user hasn't spoken at all, auto-stop after 5 seconds of silence
+          if (elapsedSinceStart > 5000) {
+            console.log("[Tarang Silence Detection] No speech detected for 5s. Auto-stopping. Volume:", averageVolume.toFixed(2));
             stopRecording();
           }
         } else {
-          // If the user has spoken, auto-stop after 1.2 seconds of silence
-          if (elapsedSinceStart > 1200) {
-            console.log("[Tarang Silence Detection] 1.2s silence detected. Auto-stopping.");
+          // Instantly stop if volume falls below 20 (silence) for 600ms, otherwise allow 1200ms for small speech pauses
+          const silenceDelay = (averageVolume < 20) ? 600 : 1200;
+          if (elapsedSinceStart > silenceDelay) {
+            console.log(`[Tarang Silence Detection] Silence detected (${silenceDelay}ms) at volume ${averageVolume.toFixed(2)}. Auto-stopping and processing command.`);
             stopRecording();
           }
         }
@@ -2262,6 +2580,7 @@ function stopVisualizer() {
     cancelAnimationFrame(visualizerFrameId);
     visualizerFrameId = null;
   }
+  filteredStreamNode = null;
   const canvas = document.getElementById('tarang-wave-canvas');
   if (canvas) {
     canvas.style.opacity = '0';

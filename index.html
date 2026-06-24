@@ -9,16 +9,63 @@
   <!-- Blank Favicon to prevent 404 GET errors -->
   <link rel="icon" href="data:,">
 
-  <!-- Silence cdn.tailwindcss.com production warning in console -->
+  <!-- Console Sanitizer: Suppresses known third-party warnings and iframe origin mismatch errors -->
   <script>
     (function() {
       const originalWarn = console.warn;
       console.warn = function(...args) {
-        if (args[0] && typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) {
+        const msg = args.map(a => (a && typeof a === 'object') ? a.message || JSON.stringify(a) : String(a)).join(' ');
+        if (
+          msg.includes('cdn.tailwindcss.com') ||
+          msg.includes('postMessage') ||
+          msg.includes('youtube.com') ||
+          msg.includes('DOMWindow') ||
+          msg.includes('Visualizer mic') ||
+          msg.includes('SpeechRecognition')
+        ) {
           return;
         }
         originalWarn.apply(console, args);
       };
+
+      const originalError = console.error;
+      console.error = function(...args) {
+        const msg = args.map(a => (a && typeof a === 'object') ? a.message || JSON.stringify(a) : String(a)).join(' ');
+        if (
+          msg.includes('postMessage') ||
+          msg.includes('DOMWindow') ||
+          msg.includes('youtube.com') ||
+          msg.includes('origin')
+        ) {
+          return;
+        }
+        originalError.apply(console, args);
+      };
+
+      // Suppress cross-origin security warnings/exceptions from third-party iframes
+      window.addEventListener('error', function(event) {
+        const msg = event.message || '';
+        if (
+          msg.includes('postMessage') ||
+          msg.includes('DOMWindow') ||
+          msg.includes('youtube') ||
+          msg.includes('origin')
+        ) {
+          event.preventDefault();
+        }
+      }, true);
+
+      window.addEventListener('unhandledrejection', function(event) {
+        const reason = event.reason ? (event.reason.message || event.reason.toString() || '') : '';
+        if (
+          reason.includes('postMessage') ||
+          reason.includes('DOMWindow') ||
+          reason.includes('youtube') ||
+          reason.includes('origin')
+        ) {
+          event.preventDefault();
+        }
+      }, true);
     })();
   </script>
 
@@ -95,6 +142,26 @@
   </style>
 </head>
 <body class="min-h-screen flex flex-col relative overflow-x-hidden pb-36 selection:bg-purple-500/30 selection:text-white">
+
+  <!-- === WAKE WORD ACTIVATION OVERLAY === -->
+  <div id="tarang-activate-overlay" class="fixed inset-0 bg-black/95 backdrop-blur-2xl flex flex-col items-center justify-center p-6 z-[100] transition-all duration-500">
+    <div class="max-w-md text-center space-y-6 animate-fade-in-up">
+      <div class="w-20 h-20 rounded-3xl bg-purple-500/10 border border-purple-500/30 flex items-center justify-center text-purple-400 mx-auto shadow-2xl shadow-purple-500/20">
+        <svg xmlns="http://www.w3.org/2000/svg" class="h-10 w-10 text-purple-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/>
+        </svg>
+      </div>
+      <div class="space-y-2">
+        <h2 class="text-3xl font-black font-display text-white">Activate Tarang</h2>
+        <p class="text-gray-400 text-sm max-w-sm mx-auto leading-relaxed">
+          Chrome requires a user interaction gesture to enable always-on speech recognition. Click below to initialize the voice pipeline.
+        </p>
+      </div>
+      <button id="activate-tarang-btn" class="w-full bg-gradient-to-r from-purple-500 to-indigo-600 hover:from-purple-400 hover:to-indigo-500 text-white font-bold py-4 px-6 rounded-2xl shadow-xl shadow-purple-500/25 hover:shadow-purple-500/45 active:scale-[0.99] transition-all cursor-pointer tracking-wider text-sm uppercase">
+        🎙️ Activate Always-On Voice
+      </button>
+    </div>
+  </div>
 
   <!-- === AMBIENT BACKGROUND BLOBS === -->
   <div class="ambient-blob top-[-8%] left-[-12%] w-[clamp(350px,55vw,750px)] h-[clamp(350px,55vw,750px)] bg-purple-600/10"></div>
@@ -328,14 +395,18 @@
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z"/>
           </svg>
         </div>
-        <span id="tarang-state-dot" class="absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-purple-500 border-2 border-[#06050b] transition-all duration-300"></span>
+        <span id="tarang-state-dot" class="absolute -top-0.5 -right-0.5 w-3 h-3 rounded-full bg-zinc-500 border-2 border-[#06050b] transition-all duration-300"></span>
       </div>
 
       <!-- Text Content -->
       <div class="flex-grow min-w-0">
-        <div class="text-[0.65rem] font-bold text-purple-400 uppercase tracking-widest mb-0.5">Tarang Assistant</div>
-        <div id="tarang-status" class="font-display font-bold text-white text-sm leading-snug truncate">Click mic to speak</div>
+        <div class="flex items-center gap-2 mb-0.5">
+          <div class="text-[0.65rem] font-bold text-purple-400 uppercase tracking-widest">Tarang Assistant</div>
+          <span class="px-2 py-0.5 rounded-full text-[9px] bg-purple-500/20 text-purple-300 font-semibold border border-purple-500/20 whitespace-nowrap">👂 Listening...</span>
+        </div>
+        <div id="tarang-status" class="font-display font-bold text-white text-sm leading-snug truncate">👂 Passive</div>
         <div id="tarang-transcript" class="text-gray-500 text-[0.68rem] italic truncate mt-0.5">Ready to listen</div>
+        <button id="tarang-reactivate-btn" class="hidden text-[0.65rem] text-purple-400 underline hover:text-purple-300 transition-colors mt-0.5 cursor-pointer text-left block">🎙️ Reactivate Voice Engine</button>
       </div>
 
       <!-- Live Waveform bars (shown when listening) -->
@@ -344,14 +415,6 @@
         <div class="bar2 w-1 rounded-full bg-purple-300"></div>
         <div class="bar3 w-1 rounded-full bg-violet-400"></div>
         <div class="bar4 w-1 rounded-full bg-purple-400"></div>
-      </div>
-
-      <!-- Toggle Switch for enabling/disabling Tarang -->
-      <div class="flex items-center flex-shrink-0 ml-1">
-        <label class="relative inline-flex items-center cursor-pointer select-none" title="Toggle Tarang Voice Assistant">
-          <input type="checkbox" id="tarang-toggle" class="sr-only peer" checked>
-          <div class="w-9 h-5 bg-zinc-800/80 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-zinc-400 after:border-zinc-300 after:border after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-purple-600 peer-checked:after:bg-white peer-checked:after:border-transparent"></div>
-        </label>
       </div>
     </div>
   </div>
@@ -394,6 +457,17 @@
             class="w-full px-4 py-3 rounded-xl glass-input text-white text-sm placeholder-gray-600 focus:placeholder-gray-500 transition-all"
             placeholder="AIzaSy..."
           >
+        </div>
+
+        <div class="space-y-2">
+          <label class="text-[var(--font-small)] font-semibold text-gray-400 uppercase tracking-wider block" for="voice-engine-select">Voice Transcription Engine</label>
+          <select
+            id="voice-engine-select"
+            class="w-full px-4 py-3 rounded-xl glass-input text-white text-sm transition-all bg-[#09080f] border border-white/10 text-white"
+          >
+            <option value="browser" class="bg-[#09080f] text-white">Browser Speech Recognition (Real-time)</option>
+            <option value="backend" class="bg-[#09080f] text-white">Gemini Multimodal Backend (Highly Accurate)</option>
+          </select>
         </div>
 
         <div class="text-[var(--font-small)] text-gray-500 leading-relaxed bg-purple-950/20 border border-purple-500/10 rounded-xl p-4">

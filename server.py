@@ -6,8 +6,91 @@ import re
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+
+# Manually load environment variables from .env file if it exists
+def load_dotenv():
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if os.path.exists(env_path):
+        try:
+            with open(env_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        key_val = line.split('=', 1)
+                        if len(key_val) == 2:
+                            key = key_val[0].strip()
+                            val = key_val[1].strip().strip('"').strip("'")
+                            os.environ[key] = val
+                            if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+                                print(f"[Dotenv] Loaded: {key}")
+        except Exception as e:
+            print(f"Error loading .env file: {e}")
+
+# Security: API key loaded from .env file only — never from client requests in production
+load_dotenv()
+
+# Try to import ADK agents — fall back to legacy if ADK not available
+try:
+    from agents import run_tarang_agent_pipeline
+    ADK_AVAILABLE = True
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        print("[Tarang] ADK multi-agent pipeline: LOADED")
+except ImportError as e:
+    ADK_AVAILABLE = False
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        print(f"[Tarang] ADK not available, using legacy curation: {e}")
+
+
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 app = Flask(__name__, static_folder='.')
+
+# Security: CORS — restrict API access to known frontend origins only
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "https://tarang-music.onrender.com",  # update this after Render deployment
+    os.environ.get("FRONTEND_URL", "")    # set this env var in production
+]
+
+CORS(app, resources={
+    r"/api/*": {
+        "origins": ALLOWED_ORIGINS,
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type", "X-Gemini-API-Key"]
+    }
+})
+
+print(f"[Security] CORS enabled for origins: {[o for o in ALLOWED_ORIGINS if o]}")
+
+def sanitize_text_input(text, max_length=500, field_name="input"):
+    """Sanitize and validate text inputs across all endpoints."""
+    if not text:
+        return None, f"{field_name} is required"
+    if not isinstance(text, str):
+        return None, f"{field_name} must be a string"
+    # Strip whitespace
+    text = text.strip()
+    if not text:
+        return None, f"{field_name} cannot be empty or whitespace"
+    # Length limit
+    if len(text) > max_length:
+        return None, f"{field_name} exceeds maximum length of {max_length} characters"
+    # Basic XSS: strip HTML tags
+    import re
+    text = re.sub(r'<[^>]+>', '', text)
+    # Remove null bytes
+    text = text.replace('\x00', '')
+    return text, None
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    storage_uri="memory://"
+)
 
 def check_playability(video_id):
     """
@@ -150,10 +233,12 @@ def search_and_verify(query):
         return None, [], f"ERROR: {str(e)}"
 
 @app.route('/api/search')
+@limiter.limit("30 per minute")
 def api_search():
-    query = request.args.get('q', '')
-    if not query:
-        return jsonify({'error': 'Query parameter "q" is required'}), 400
+    query_raw = request.args.get('q', '')
+    query, query_err = sanitize_text_input(query_raw, max_length=200, field_name="query")
+    if query_err:
+        return jsonify({'error': query_err}), 400
         
     print(f"=== Primary Search: '{query}' ===")
     vid, candidates_log, status = search_and_verify(query)
@@ -264,17 +349,130 @@ def execute_gemini_multimodal_request(payload, api_key):
             
     raise Exception(f"All generative voice models failed. Last error: {last_error}")
 
+def execute_gemini_text_request(prompt, model_name, version, api_key):
+    url = f"https://generativelanguage.googleapis.com/{version}/models/{model_name}:generateContent?key={api_key}"
+    payload = {
+        "contents": [{ "parts": [{ "text": prompt }] }],
+        "generationConfig": { "responseMimeType": "application/json" }
+    }
+    req_data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(
+        url,
+        data=req_data,
+        headers={'Content-Type': 'application/json'}
+    )
+    response = urllib.request.urlopen(req, timeout=12)
+    res_data = response.read().decode('utf-8')
+    res_json = json.loads(res_data)
+    candidates = res_json.get("candidates", [])
+    if candidates:
+        text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+        if text:
+            return text
+    raise Exception("Response body missing candidates or text content")
+
+def curate_with_gemini_backend(vibe, excluded_songs, api_key):
+    exclusion_prompt = ''
+    if excluded_songs:
+        exclusion_prompt = f"\n- DO NOT include any of the following songs: {', '.join(excluded_songs[:55])}."
+        
+    prompt = f"""You are a world-class music curator specializing in Indian music. Analyze the user's emotional state described below, and curate EXACTLY 25 real Hindi songs that match this mood.
+
+CONSTRAINTS:
+- Songs MUST be in Hindi (Bollywood, Hindi indie, or Hindi pop/classical). No English songs.
+- Song titles and artists must be real and well-known.{exclusion_prompt}
+- Return EXACTLY 25 items. Variety is important — mix eras, tempos, and artists.
+
+User mood: "{vibe}"
+
+Output a JSON array. No markdown, no wrapping. Each object:
+{{"title":"Song Title","artist":"Artist Name","explanation":"1-sentence poetic reason why this matches."}}
+
+JSON array:"""
+
+    models_to_try = [
+        {"name": "gemini-2.5-flash", "version": "v1beta"},
+        {"name": "gemini-2.0-flash", "version": "v1beta"},
+        {"name": "gemini-2.5-flash-lite", "version": "v1beta"},
+        {"name": "gemini-1.5-flash", "version": "v1"},
+        {"name": "gemini-1.5-flash", "version": "v1beta"},
+        {"name": "gemini-pro", "version": "v1beta"}
+    ]
+    
+    last_error = None
+    for m in models_to_try:
+        try:
+            print(f"Attempting backend curation with: {m['name']} ({m['version']})")
+            text_res = execute_gemini_text_request(prompt, m["name"], m["version"], api_key)
+            if text_res:
+                clean_text = text_res.replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(clean_text)
+                if isinstance(parsed, list) and len(parsed) > 0:
+                    print(f"Backend curation succeeded with: {m['name']}")
+                    return parsed[:25]
+        except Exception as e:
+            print(f"Backend curation fallback model {m['name']} failed: {e}")
+            last_error = e
+            
+    raise Exception(f"All Gemini models failed to curate playlist. Last error: {last_error}")
+
+@app.route('/api/status')
+def api_status():
+    client_key = request.headers.get('X-Gemini-API-Key')
+    return jsonify({
+        'gemini_active': bool(client_key or os.environ.get('GEMINI_API_KEY'))
+    })
+
+@app.route('/api/curate', methods=['POST'])
+def api_curate():
+    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+        
+    data = request.json or {}
+    vibe_raw = data.get('vibe', '')
+    vibe, vibe_err = sanitize_text_input(vibe_raw, max_length=500, field_name="vibe")
+    if vibe_err:
+        return jsonify({'error': vibe_err}), 400
+    excluded_songs = data.get('excludedSongs', [])
+        
+    try:
+        # Try ADK multi-agent pipeline first, fall back to legacy
+        if ADK_AVAILABLE:
+            print("[OrchestratorAgent] Using ADK multi-agent pipeline")
+            try:
+                songs, emotion_data = run_tarang_agent_pipeline(vibe, excluded_songs, api_key)
+                return jsonify({
+                    'songs': songs,
+                    'emotion_analysis': emotion_data,  # bonus: send emotion data to frontend
+                    'pipeline': 'adk_multi_agent'
+                })
+            except Exception as adk_err:
+                print(f"[OrchestratorAgent] ADK pipeline failed, falling back: {adk_err}")
+                # Fall through to legacy below
+
+        # Legacy fallback (existing code — keep it exactly as is)
+        songs = curate_with_gemini_backend(vibe, excluded_songs, api_key)
+        return jsonify({'songs': songs, 'pipeline': 'legacy'})
+    except Exception as e:
+        print(f"Curation failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
 @app.route('/api/voice-curate', methods=['POST'])
 def api_voice_curate():
+    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+
     data = request.json or {}
     audio_base64 = data.get('audio', '')
     mime_type = data.get('mimeType', 'audio/webm')
-    api_key = data.get('apiKey', '')
     
     if not audio_base64:
         return jsonify({'error': 'Audio data is required'}), 400
-    if not api_key:
-        return jsonify({'error': 'Gemini API key is required'}), 400
+        
+    if len(audio_base64) > 10 * 1024 * 1024:
+        return jsonify({'error': 'Audio payload exceeds maximum size limit (10MB)'}), 400
         
     print(f"=== Multimodal Voice Curation Request ({mime_type}) ===")
     
@@ -336,15 +534,19 @@ def api_voice_curate():
 
 @app.route('/api/transcribe', methods=['POST'])
 def api_transcribe():
+    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    if not api_key:
+        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+
     data = request.json or {}
     audio_base64 = data.get('audio', '')
     mime_type = data.get('mimeType', 'audio/webm')
-    api_key = data.get('apiKey', '')
     
     if not audio_base64:
         return jsonify({'error': 'Audio data is required'}), 400
-    if not api_key:
-        return jsonify({'error': 'Gemini API key is required'}), 400
+        
+    if len(audio_base64) > 10 * 1024 * 1024:
+        return jsonify({'error': 'Audio payload exceeds maximum size limit (10MB)'}), 400
         
     print(f"=== Multimodal Voice Transcription Request ({mime_type}) ===")
     
@@ -393,5 +595,7 @@ def api_transcribe():
 if __name__ == '__main__':
     # Disable file caching for static files during development
     app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
-    print("Starting Mood-to-Music Curator server on http://localhost:3000...")
-    app.run(port=3000, debug=True, threaded=True)
+    if os.environ.get('WERKZEUG_RUN_MAIN') != 'true':
+        print("Starting Mood-to-Music Curator server on http://localhost:3000...")
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
