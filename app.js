@@ -337,6 +337,10 @@ function loadYoutubeVideo(videoId) {
   }
 }
 
+// Kaggle Capstone: Automatic Queue Advancement & Continuous Playback Loop
+// This event listener monitors state updates from the YouTube Player API. When a song finishes playing,
+// it checks if autoplay is enabled and automatically pulls a new random/next song from the curated playlist,
+// ensuring an uninterrupted, hands-free listening experience.
 // Handle player status changes (Autoplay Next)
 function onPlayerStateChange(event) {
   // event.data === YT.PlayerState.ENDED (0)
@@ -561,6 +565,10 @@ function renderHistoryChips() {
 }
 
 // Main Curate Handler
+// Kaggle Capstone: Dual-Support Curation Input Handler
+// This function acts as the central hub for executing playlist curation. It accepts inputs
+// from both the standard text input box (submit/enter events) and the voice assistant FSM
+// (after converting spoken mood descriptions to text).
 async function handleCuration(vibe) {
   if (state.curating || !vibe.trim()) return;
 
@@ -1213,6 +1221,20 @@ const TarangVoiceEngine = {
     return (typeof speechSynthesis !== 'undefined' && speechSynthesis.speaking) || tarangSpeaking || tarangState === 'executing';
   },
 
+  // =========================================================================
+  // Kaggle Capstone: 3-State Voice FSM (Finite State Machine)
+  //
+  // The Tarang Voice Assistant operates on a structured Finite State Machine:
+  // 1. PASSIVE (Sleep/Listening mode): Continuously monitors the ambient audio
+  //    channel for the wake word ("Hey Tarang" or "Tarang") using low-power browser speech 
+  //    recognition or backend snapshot transcripts.
+  // 2. AWAKE (Active/Command mode): Triggered upon hearing the wake word. The assistant
+  //    ducks the music volume, updates the visualizer, and waits for a spoken command
+  //    (curation command, control instruction, or sleep command).
+  // 3. EXECUTING (Action mode): Processes the parsed command, triggers API requests
+  //    for curation or controls the media player, responds to the user via TTS,
+  //    and transitions back to PASSIVE or AWAKE.
+  // =========================================================================
   init() {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {

@@ -1,4 +1,11 @@
 # agents.py — Tarang Multi-Agent System using Google ADK
+"""
+Tarang Multi-Agent System using Google ADK.
+This module implements a 3-agent pipeline designed to analyze user emotion and curate music:
+1. OrchestratorAgent: Oversees the execution flow, session management, and coordinates messages.
+2. EmotionAgent: Analyzes sentiment, energy, tempo, and context from user inputs.
+3. MusicAgent: Recommends real Hindi songs matching the emotional profile, ignoring excluded songs.
+"""
 
 import json
 import os
@@ -132,8 +139,14 @@ def create_music_agent(api_key: str, model_name: str) -> Agent:
 
 
 def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, model_name: str) -> list:
+    # Session Creation & User Isolation:
+    # We instantiate InMemorySessionService to create isolated, stateful sessions for each request.
+    # This guarantees that individual user states/conversation flows do not interfere with each other.
     session_service = InMemorySessionService()
     
+    # The Transition from Orchestrator -> EmotionAgent:
+    # Orchestrator coordinates the pipeline flow. It spawns the EmotionAgent, which takes
+    # raw vibe text from the user and analyzes the underlying feelings, intensity, energy, and tempo.
     # Step 1: Run EmotionAgent
     print(f"[OrchestratorAgent] Starting pipeline for vibe: '{vibe[:50]}...'")
     
@@ -170,6 +183,10 @@ def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, mode
     
     print(f"[EmotionAgent] Result: {emotion_result_text[:100]}")
     
+    # The JSON Parsing & Error Fallback Mechanism:
+    # We clean and attempt to parse the EmotionAgent's output text to a structured JSON object.
+    # In case of any API or parsing exception, a fallback emotion profile (defaulting to chill, medium energy)
+    # is returned so that the pipeline does not break and can proceed to the music curation phase.
     # Parse emotion result
     try:
         emotion_data = _clean_and_parse_json(emotion_result_text)
@@ -184,6 +201,10 @@ def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, mode
             "context": vibe
         }
     
+    # The Transition from EmotionAgent -> MusicAgent:
+    # We construct a prompt passing the structured emotion profile context (intensity, tempo, energy)
+    # directly to the MusicAgent. Crucially, the list of previously skipped/excluded songs is appended
+    # to the music prompt to instruct the MusicAgent to ignore them and offer fresh recommendations.
     # Step 2: Run MusicAgent with emotion data + exclusions
     print(f"[OrchestratorAgent] Passing emotion tags to MusicAgent...")
     
