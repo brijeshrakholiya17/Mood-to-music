@@ -337,7 +337,7 @@ def execute_gemini_multimodal_request(payload, api_key):
         {"name": "gemini-flash-latest", "version": "v1beta"},
     ]
     
-    last_error = None
+    errors = []
     for model in models_to_try:
         url = f"https://generativelanguage.googleapis.com/{model['version']}/models/{model['name']}:generateContent?key={api_key}"
         print(f"Attempting Gemini request on model fallback: {model['name']} ({model['version']})")
@@ -358,7 +358,7 @@ def execute_gemini_multimodal_request(payload, api_key):
                 if text:
                     print(f"Resolved successful response with model: {model['name']}")
                     return text
-            last_error = "Response body missing candidates or text content"
+            errors.append(f"{model['name']}: Response body missing candidates or text content")
         except urllib.error.HTTPError as e:
             err_body = ""
             try:
@@ -366,12 +366,12 @@ def execute_gemini_multimodal_request(payload, api_key):
             except Exception as read_err:
                 err_body = f"Failed to read body: {read_err}"
             print(f"Model fallback {model['name']} ({model['version']}) failed with HTTP {e.code}: {e.reason}. Body: {err_body}")
-            last_error = f"HTTP Error {e.code}: {e.reason} - {err_body}"
+            errors.append(f"{model['name']} (HTTP {e.code}): {e.reason} - {err_body}")
         except Exception as e:
             print(f"Model fallback {model['name']} ({model['version']}) request failed: {e}")
-            last_error = str(e)
+            errors.append(f"{model['name']}: {str(e)}")
             
-    raise Exception(f"All generative voice models failed. Last error: {last_error}")
+    raise Exception(f"All generative voice models failed. Details: {'; '.join(errors)}")
 
 def execute_gemini_text_request(prompt, model_name, version, api_key):
     url = f"https://generativelanguage.googleapis.com/{version}/models/{model_name}:generateContent?key={api_key}"
@@ -423,7 +423,7 @@ JSON array:"""
         {"name": "gemini-pro", "version": "v1beta"}
     ]
     
-    last_error = None
+    errors = []
     for m in models_to_try:
         try:
             print(f"Attempting backend curation with: {m['name']} ({m['version']})")
@@ -436,15 +436,23 @@ JSON array:"""
                     return parsed[:25]
         except Exception as e:
             print(f"Backend curation fallback model {m['name']} failed: {e}")
-            last_error = e
+            errors.append(f"{m['name']}: {e}")
             
-    raise Exception(f"All Gemini models failed to curate playlist. Last error: {last_error}")
+    raise Exception(f"All Gemini models failed to curate playlist. Details: {'; '.join(errors)}")
+
+def get_clean_api_key():
+    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    if api_key:
+        api_key = api_key.strip().strip('"').strip("'")
+        if not api_key or any(p in api_key.lower() for p in ["your_gemini_api_key_here", "your_actual_api_key_here", "gemini_api_key", "your-gemini-api-key"]):
+            return None
+    return api_key
 
 @app.route('/api/status')
 def api_status():
-    client_key = request.headers.get('X-Gemini-API-Key')
+    api_key = get_clean_api_key()
     return jsonify({
-        'gemini_active': bool(client_key or os.environ.get('GEMINI_API_KEY'))
+        'gemini_active': bool(api_key)
     })
 
 @app.route('/api/curate', methods=['POST'])
@@ -457,9 +465,9 @@ def api_curate():
     2. Fallback Flow: If the ADK pipeline fails due to quota or model availability, it gracefully falls back
        to the single-agent legacy curation method (curate_with_gemini_backend) to ensure uninterrupted service.
     """
-    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    api_key = get_clean_api_key()
     if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+        return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
         
     data = request.json or {}
     vibe_raw = data.get('vibe', '')
@@ -492,9 +500,9 @@ def api_curate():
 
 @app.route('/api/voice-curate', methods=['POST'])
 def api_voice_curate():
-    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    api_key = get_clean_api_key()
     if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+        return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
 
     data = request.json or {}
     audio_base64 = data.get('audio', '')
@@ -566,9 +574,9 @@ def api_voice_curate():
 
 @app.route('/api/transcribe', methods=['POST'])
 def api_transcribe():
-    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    api_key = get_clean_api_key()
     if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured.'}), 400
+        return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
 
     data = request.json or {}
     audio_base64 = data.get('audio', '')
