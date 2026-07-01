@@ -62,21 +62,22 @@ Return ONLY the JSON. No explanation. No markdown.
 """
 
 # ── Agent 2: MusicAgent ───────────────────────────────────────────────────
-# Takes emotion tags from EmotionAgent → curates Hindi songs
+# Takes emotion tags from EmotionAgent → curates songs
 
-MUSIC_AGENT_INSTRUCTION = """
-You are MusicAgent, a world-class Hindi music curator specializing in Bollywood and Indian indie music.
+def get_music_agent_instruction(language: str = "Hindi") -> str:
+    return f"""You are MusicAgent, a world-class {language} music curator specializing in {language} music.
 
-You will receive structured emotion data from EmotionAgent and must curate exactly 25 real Hindi songs matching that emotional profile.
+You will receive structured emotion data from EmotionAgent and must curate exactly 25 real {language} songs matching that emotional profile.
 
 Rules:
-- Songs MUST be real Hindi/Bollywood/Hindi-indie songs
+- Songs MUST be real {language} songs
 - Match the energy_level and tempo_preference from the emotion data
 - Vary the eras (classic to modern) and artists
+- The dj_intro must be a short, highly conversational 1-to-2 sentence radio transition. It should react to the user's emotional state, hype up the upcoming track, and introduce the artist naturally (e.g., 'Let's lift the vibe a bit. Up next is Arijit Singh with...' or 'Let's keep the energy high. Up next is Adele with...').
 - Return ONLY a valid JSON array, no markdown, no wrapping
 
 Each item:
-{"title": "Song Title", "artist": "Artist Name", "explanation": "One poetic sentence why this matches the mood"}
+{{"title": "Song Title", "artist": "Artist Name", "reason": "One poetic sentence why this matches the mood", "dj_intro": "Short conversational radio transition intro"}}
 """
 
 # ── Agent 3: OrchestratorAgent ────────────────────────────────────────────
@@ -135,16 +136,16 @@ def create_emotion_agent(api_key: str, model_name: str) -> Agent:
     )
 
 
-def create_music_agent(api_key: str, model_name: str) -> Agent:
+def create_music_agent(api_key: str, model_name: str, language: str = "Hindi") -> Agent:
     return Agent(
         name="MusicAgent", 
         model=KeyedGemini(model=model_name, api_key=api_key),
-        description="Curates Hindi songs based on emotion tags",
-        instruction=MUSIC_AGENT_INSTRUCTION
+        description=f"Curates {language} songs based on emotion tags",
+        instruction=get_music_agent_instruction(language)
     )
 
 
-def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, model_name: str) -> list:
+def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, model_name: str, language: str = "Hindi") -> list:
     session_service = global_session_service
     
     # The Transition from Orchestrator -> EmotionAgent:
@@ -221,9 +222,9 @@ def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, mode
 Original mood description: "{vibe}"
 {exclusion_note}
 
-Curate exactly 25 Hindi songs matching this emotional profile."""
+Curate exactly 25 {language} songs matching this emotional profile."""
 
-    music_agent = create_music_agent(api_key, model_name)
+    music_agent = create_music_agent(api_key, model_name, language)
     music_runner = Runner(
         agent=music_agent,
         app_name="tarang_music",
@@ -258,6 +259,18 @@ Curate exactly 25 Hindi songs matching this emotional profile."""
     try:
         songs = _clean_and_parse_json(music_result_text)
         if isinstance(songs, list) and len(songs) > 0:
+            # Safely process songs to ensure required fields
+            for song in songs:
+                if isinstance(song, dict):
+                    # Map reason <-> explanation to prevent breaking frontend/backend mismatch
+                    if 'reason' in song and 'explanation' not in song:
+                        song['explanation'] = song['reason']
+                    elif 'explanation' in song and 'reason' not in song:
+                        song['reason'] = song['explanation']
+                    
+                    # Ensure dj_intro is populated with a safe default if missing
+                    if 'dj_intro' not in song:
+                        song['dj_intro'] = "Up next, a great track for this mood..."
             print(f"[OrchestratorAgent] Pipeline complete. {len(songs)} songs curated.")
             return songs[:25], emotion_data
     except Exception as e:
@@ -266,7 +279,7 @@ Curate exactly 25 Hindi songs matching this emotional profile."""
     raise Exception("Multi-agent pipeline failed to produce valid song list")
 
 
-def run_tarang_agent_pipeline(vibe: str, excluded_songs: list, api_key: str) -> list:
+def run_tarang_agent_pipeline(vibe: str, excluded_songs: list, api_key: str, language: str = "Hindi") -> list:
     """
     Runs the full Tarang multi-agent pipeline:
     vibe text → EmotionAgent → MusicAgent → song list
@@ -285,7 +298,7 @@ def run_tarang_agent_pipeline(vibe: str, excluded_songs: list, api_key: str) -> 
             time.sleep(2)
         try:
             print(f"[OrchestratorAgent] Attempting ADK pipeline with model: {model_name}")
-            return _run_pipeline_with_model(vibe, excluded_songs, api_key, model_name)
+            return _run_pipeline_with_model(vibe, excluded_songs, api_key, model_name, language)
         except Exception as e:
             print(f"[OrchestratorAgent] ADK pipeline failed with {model_name}: {e}")
             last_err = e

@@ -22,6 +22,7 @@ function blobToBase64(blob) {
 
 let ytPlayer = null; // YouTube Player object
 let ytLoadAttempts = 0; // Tracking YouTube script load retries
+let djTransitionPlayedForIndex = -1; // Track index of played DJ transitions
 
 // Load the YouTube Iframe Player API script dynamically
 (function() {
@@ -186,7 +187,10 @@ function curateFallback(vibe) {
     }
   }
   
-  return shuffled.slice(0, 20);
+  return shuffled.slice(0, 20).map(song => ({
+    ...song,
+    dj_intro: "Up next, a great track for this mood..."
+  }));
 }
 
 
@@ -323,7 +327,7 @@ function loadYoutubeVideo(videoId) {
         height: '100%',
         width: '100%',
         videoId: videoId,
-        host: 'https://www.youtube.com',
+        host: 'https://www.youtube-nocookie.com',
         playerVars: {
           'autoplay': 1,
           'enablejsapi': 1,
@@ -360,11 +364,33 @@ function onPlayerStateChange(event) {
   // event.data === YT.PlayerState.ENDED (0)
   if (event.data === 0) {
     if (state.autoplayEnabled) {
-      writeConsoleLog(`Playback completed. Autoplay is enabled. Picking another random song...`, 'info');
-      playRandomSong();
+      writeConsoleLog(`Playback completed. Autoplay is enabled. Loading the next song in sequence...`, 'info');
+      playNext();
     } else {
       writeConsoleLog(`Playback completed. Autoplay is disabled. Stopped.`, 'info');
       document.getElementById('player-status').textContent = "Playback completed";
+    }
+  }
+
+  // event.data === YT.PlayerState.BUFFERING (3)
+  if (event.data === 3) {
+    if (state.currentIndex >= 0 && state.currentIndex < state.playlist.length) {
+      const song = state.playlist[state.currentIndex];
+      if (song && song.dj_intro && djTransitionPlayedForIndex !== state.currentIndex) {
+        djTransitionPlayedForIndex = state.currentIndex;
+        AudioMixer.playDJTransition(song.dj_intro);
+      }
+    }
+  }
+
+  // event.data === YT.PlayerState.PLAYING (1)
+  if (event.data === 1) {
+    const isSpeaking = tarangSpeaking || (typeof TarangVoiceEngine !== 'undefined' && TarangVoiceEngine.tarangSpeaking);
+    if (isSpeaking) {
+      try {
+        ytPlayer.setVolume(10);
+        console.log("[AudioMixer] Ducking new track playback volume to 10% because DJ is speaking.");
+      } catch (e) {}
     }
   }
 }
@@ -585,6 +611,7 @@ function renderHistoryChips() {
 // (after converting spoken mood descriptions to text).
 async function handleCuration(vibe) {
   if (state.curating || !vibe.trim()) return;
+  let curationTicker = null;
 
   // Clear input field on Curation Start
   const moodInput = document.getElementById('mood-input');
@@ -645,16 +672,31 @@ async function handleCuration(vibe) {
           memory.map(c => `- Spoke: "${c.raw}" (Intent: ${c.intent}, Action: ${c.action})`).join('\n');
       }
       
+      let remainingSeconds = 24;
+      curationTicker = setInterval(() => {
+        remainingSeconds -= 6;
+        if (remainingSeconds > 0 && state.curating) {
+          const msg = `Please wait, your customized track playlist is compiling. Approximately ${remainingSeconds} seconds left.`;
+          tarangSpeak(msg, 'en');
+        } else {
+          if (curationTicker) {
+            clearInterval(curationTicker);
+            curationTicker = null;
+          }
+        }
+      }, 6000);
+
       while (workingSongs.length < 20 && attempts < maxAttempts) {
         attempts++;
         writeConsoleLog(`Gemini Curation Attempt #${attempts} (Current Playable Count: ${workingSongs.length}/20)`, "info");
         
         let candidates = [];
         try {
+          const selectedLanguage = document.getElementById('languageSelect') ? document.getElementById('languageSelect').value : 'Hindi';
           const response = await fetch('/api/curate', {
             method: 'POST',
             headers: getHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify({ vibe: vibeWithContext, excludedSongs })
+            body: JSON.stringify({ vibe: vibeWithContext, excludedSongs, language: selectedLanguage })
           });
           if (!response.ok) {
             const errorData = await response.json().catch(() => ({}));
@@ -817,6 +859,10 @@ async function handleCuration(vibe) {
       TarangVoiceEngine.transitionTo('passive');
     }
   } finally {
+    if (curationTicker) {
+      clearInterval(curationTicker);
+      curationTicker = null;
+    }
     state.curating = false;
     button.disabled = false;
     button.classList.remove('opacity-85', 'cursor-not-allowed');
@@ -1053,6 +1099,27 @@ document.addEventListener('DOMContentLoaded', () => {
       handleTarangMicClick();
     });
   }
+
+  // Wire up Voice Toggle
+  const voiceToggle = document.getElementById('voiceToggle');
+  if (voiceToggle) {
+    voiceToggle.addEventListener('change', () => {
+      if (!voiceToggle.checked) {
+        TarangVoiceEngine.stop();
+      } else {
+        if (!vizStream) {
+          TarangVoiceEngine.start().then(() => {
+            TarangVoiceEngine.forceRestartRecognition();
+          });
+        } else {
+          TarangVoiceEngine.tarangActive = true;
+          tarangActive = true;
+          tarangEnabled = true;
+          TarangVoiceEngine.forceRestartRecognition();
+        }
+      }
+    });
+  }
 });
 
 // ==========================================
@@ -1072,6 +1139,7 @@ let tarangDetectedLang = 'en';     // Last detected language
 let tarangMoodBuffer = '';         // Accumulated mood description from voice
 let tarangSilenceTimer = null;     // 2s silence detector timer
 let tarangNetworkRetryDelay = 200; // Restart delay in ms (backs off on network error)
+let isMicInitializing = false;    // Atomic lock pattern wrapper to prevent parallel starts
 
 // Always-On Jarvis FSM state variables
 let tarangFSMState = 'PASSIVE';
@@ -1108,6 +1176,11 @@ function saveTarangMemory(raw, intent, action) {
 
 function resolveIntentAndAction(text) {
   const t = text.toLowerCase();
+  
+  // Early-exit keyword fallback check
+  if (t.includes("mood")) {
+    return { intent: 'curate_mood', action: 'triggerCurationFromVoice' };
+  }
   
   // Stop / Pause
   const stopWords = ['stop', 'pause', 'ruk', 'ruko', 'band', 'bandh', 'band karo', 'bandh karo', 'roko', 'stop music', 'pause music'];
@@ -1282,6 +1355,7 @@ const TarangVoiceEngine = {
 
     this.recognition.onstart = () => {
       this.recognitionIsListening = true;
+      isMicInitializing = false; // Release mic initialization lock
       console.log('[Tarang] Mic LIVE ✓ | SpeechRecognition started');
     };
 
@@ -1381,6 +1455,7 @@ const TarangVoiceEngine = {
     };
 
     this.recognition.onerror = (event) => {
+      isMicInitializing = false; // Release lock on error
       if (event.error === 'no-speech') {
         return; // Early return, let onend handle restart
       }
@@ -1411,6 +1486,7 @@ const TarangVoiceEngine = {
 
     this.recognition.onend = () => {
       this.recognitionIsListening = false;
+      isMicInitializing = false; // Release lock on end
       const isSpeakingState = this.isSpeaking || (typeof speechSynthesis !== 'undefined' && speechSynthesis.speaking);
       const isCurationState = state.curating || tarangState === 'processing';
 
@@ -1428,18 +1504,29 @@ const TarangVoiceEngine = {
   },
 
   startRecognitionInstance() {
+    const toggle = document.getElementById('voiceToggle');
+    if (toggle && !toggle.checked) {
+      return;
+    }
     if (!this.recognition) return;
     if (this.isSpeaking || state.curating || tarangState === 'greeting' || tarangState === 'processing') {
       return;
     }
+    if (isMicInitializing) return; // Prevent concurrent starts
+    isMicInitializing = true;
     try {
       this.recognition.start();
     } catch(e) {
       if (e.name !== 'InvalidStateError') console.error('[Tarang] start() error:', e);
+      isMicInitializing = false;
     }
   },
 
   forceRestartRecognition() {
+    const toggle = document.getElementById('voiceToggle');
+    if (toggle && !toggle.checked) {
+      return;
+    }
     if (useBackendTranscription) {
       if (this.tarangActive && tarangState === 'passive') {
         this.startPassiveBackendLoop();
@@ -1453,20 +1540,31 @@ const TarangVoiceEngine = {
     } catch(e) {}
     
     setTimeout(() => {
+      const innerToggle = document.getElementById('voiceToggle');
+      if (innerToggle && !innerToggle.checked) {
+        return;
+      }
       if (this.isSpeaking || state.curating || tarangState === 'greeting' || tarangState === 'processing') {
         return;
       }
+      if (isMicInitializing) return; // Prevent concurrent starts
+      isMicInitializing = true;
       try {
         this.recognition.start();
         console.log("[Tarang] Mic LIVE ✓ | SpeechRecognition started");
         console.log("Listening for wakeup word...");
       } catch(e) {
         // Silently handle InvalidStateError
+        isMicInitializing = false;
       }
     }, 300);
   },
 
   startPassiveBackendLoop() {
+    const toggle = document.getElementById('voiceToggle');
+    if (toggle && !toggle.checked) {
+      return;
+    }
     // Passive wake word detection using short audio snapshots sent to Gemini transcribe
     if (!this.tarangActive || tarangState !== 'passive') return;
     if (this._passiveLoopRunning) return;
@@ -1582,6 +1680,10 @@ const TarangVoiceEngine = {
   },
 
   async start() {
+    const toggle = document.getElementById('voiceToggle');
+    if (toggle && !toggle.checked) {
+      return;
+    }
     // 1. Verify microphone permission before starting
     try {
       if (!vizStream) {
@@ -1647,6 +1749,7 @@ const TarangVoiceEngine = {
     tarangSpeaking = false;
     tarangWake = false;
     tarangEnabled = false;
+    isMicInitializing = false; // Reset lock on stop
     
     if (awakeTimeout) {
       clearTimeout(awakeTimeout);
@@ -2188,81 +2291,19 @@ async function verifyAndPlayVoiceCuration(candidates, vibe) {
   }
 }
 
+function transitionToState(stateName) {
+  if (typeof TarangVoiceEngine !== 'undefined' && TarangVoiceEngine.transitionTo) {
+    TarangVoiceEngine.transitionTo(stateName);
+  }
+}
+
 // 7. COMMAND ROUTER
 function routeTarangCommand(text) {
   const cleanText = text.trim();
   console.log(`Heard command: "${cleanText}"`);
 
-  // Stop / Pause
-  const stopWords = ['stop', 'pause', 'ruk', 'ruko', 'band', 'bandh', 'band karo', 'bandh karo', 'roko', 'stop music', 'pause music'];
-  if (stopWords.some(w => text.includes(w))) {
-    if (state.playlist.length === 0) {
-      tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
-      return;
-    }
-    if (ytPlayer && ytPlayer.pauseVideo) {
-      try { ytPlayer.pauseVideo(); } catch(e) {}
-    }
-    tarangRespondAndListen('Music paused.', 'en');
-    return;
-  }
-
-  // Resume / Play
-  const resumeWords = ['resume', 'unpause', 'continue playing', 'play music'];
-  if (resumeWords.some(w => text.includes(w))) {
-    if (state.playlist.length === 0) {
-      tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
-      return;
-    }
-    if (ytPlayer && ytPlayer.playVideo) {
-      try { ytPlayer.playVideo(); } catch(e) {}
-    }
-    tarangRespondAndListen('Resuming.', 'en');
-    return;
-  }
-
-  // Next / Skip
-  const nextWords = ['next', 'next song', 'skip', 'agle', 'agla', 'badlo', 'aagad', 'skip song', 'next track'];
-  if (nextWords.some(w => text.includes(w))) {
-    if (state.playlist.length === 0) {
-      tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
-      return;
-    }
-    playNext();
-    const msg = tarangDetectedLang === 'hi' ? 'अगला गाना चला रहा हूँ।' : tarangDetectedLang === 'gu' ? 'આગળ ગીત ચાલી રહ્યું છે.' : 'Playing next song.';
-    tarangRespondAndListen(msg, tarangDetectedLang);
-    return;
-  }
-
-  // Random
-  const randomWords = ['random', 'shuffle', 'any song', 'play something', 'koi bhi', 'koi bi'];
-  if (randomWords.some(w => text.includes(w))) {
-    if (state.playlist.length === 0) {
-      tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
-      return;
-    }
-    playRandomSong();
-    tarangRespondAndListen('Playing a random song.', 'en');
-    return;
-  }
-
-  // Curate my mood
-  const lowerText = text.toLowerCase();
-  const curateKeywords = [
-    'curate', 'let\'s curate', 'lets curate', 'curate my mood', 'curate my mode', 
-    'suggest songs', 'play songs', 'suggest track', 'find songs', 'get songs', 
-    'songs based on', 'mode description', 'gaane bajao', 'gana bajao', 'gaane sunao', 
-    'music lagao', 'baja do', 'bajao', 'gaane lagao', 'play music', 'suggest music',
-    'curate music', 'curate mode', 'curate mood'
-  ];
-
-  const matchesCuration = curateKeywords.some(w => lowerText.includes(w)) ||
-                          (lowerText.includes('curate') && (lowerText.includes('mood') || lowerText.includes('mode'))) ||
-                          (lowerText.includes('suggest') && (lowerText.includes('song') || lowerText.includes('music') || lowerText.includes('track') || lowerText.includes('playlist'))) ||
-                          (lowerText.includes('let\'s') && lowerText.includes('curate')) ||
-                          (lowerText.includes('lets') && lowerText.includes('curate'));
-
-  if (matchesCuration) {
+  // Early-exit keyword fallback check
+  if (cleanText.toLowerCase().includes("mood")) {
     const moodInput = document.getElementById('mood-input');
     const moodText = moodInput ? moodInput.value.trim() : '';
     if (!moodText) {
@@ -2297,29 +2338,141 @@ function routeTarangCommand(text) {
     return;
   }
 
-  // Play specific song
-  const playSpecificMatch = text.match(/^(?:play|baja|laga|sun|sunao|chalao)\s+(.+)$/i);
-  if (playSpecificMatch && playSpecificMatch[1] && playSpecificMatch[1].length > 2) {
-    const songName = playSpecificMatch[1].trim();
-    if (!['music', 'songs', 'song', 'something', 'random', 'shuffle', 'curate', 'my mood'].includes(songName)) {
-      tarangPlaySpecificSong(songName);
+  try {
+    // Stop / Pause
+    const stopWords = ['stop', 'pause', 'ruk', 'ruko', 'band', 'bandh', 'band karo', 'bandh karo', 'roko', 'stop music', 'pause music'];
+    if (stopWords.some(w => text.includes(w))) {
+      if (state.playlist.length === 0) {
+        tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
+        return;
+      }
+      if (ytPlayer && ytPlayer.pauseVideo) {
+        try { ytPlayer.pauseVideo(); } catch(e) {}
+      }
+      tarangRespondAndListen('Music paused.', 'en');
       return;
     }
-  }
 
-  // Sleep / Turn off
-  const offWords = ['goodbye tarang', 'bye tarang', 'stop listening', 'sleep', 'go to sleep', 'so jao', 'bye', 'goodbye'];
-  if (offWords.some(w => text.includes(w))) {
-    tarangRespondAndListen('Goodbye! Wake me up anytime.', 'en').then(() => {
-      tarangWake = false;
-      TarangVoiceEngine.transitionTo('passive');
-    });
-    return;
-  }
+    // Resume / Play
+    const resumeWords = ['resume', 'unpause', 'continue playing', 'play music'];
+    if (resumeWords.some(w => text.includes(w))) {
+      if (state.playlist.length === 0) {
+        tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
+        return;
+      }
+      if (ytPlayer && ytPlayer.playVideo) {
+        try { ytPlayer.playVideo(); } catch(e) {}
+      }
+      tarangRespondAndListen('Resuming.', 'en');
+      return;
+    }
 
-  // Unknown command: return to passive
-  console.log(`Unknown command: "${text}". Returning to passive mode.`);
-  TarangVoiceEngine.transitionTo('passive');
+    // Next / Skip
+    const nextWords = ['next', 'next song', 'skip', 'agle', 'agla', 'badlo', 'aagad', 'skip song', 'next track'];
+    if (nextWords.some(w => text.includes(w))) {
+      if (state.playlist.length === 0) {
+        tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
+        return;
+      }
+      playNext();
+      const msg = tarangDetectedLang === 'hi' ? 'अगला गाना चला रहा हूँ।' : tarangDetectedLang === 'gu' ? 'આગળ ગીત ચાલી રહ્યું છે.' : 'Playing next song.';
+      tarangRespondAndListen(msg, tarangDetectedLang);
+      return;
+    }
+
+    // Random
+    const randomWords = ['random', 'shuffle', 'any song', 'play something', 'koi bhi', 'koi bi'];
+    if (randomWords.some(w => text.includes(w))) {
+      if (state.playlist.length === 0) {
+        tarangRespondAndListen("There is no active playlist yet. Please describe your mood to curate one.", 'en');
+        return;
+      }
+      playRandomSong();
+      tarangRespondAndListen('Playing a random song.', 'en');
+      return;
+    }
+
+    // Curate my mood
+    const lowerText = text.toLowerCase();
+    const curateKeywords = [
+      'curate', 'let\'s curate', 'lets curate', 'curate my mood', 'curate my mode', 
+      'suggest songs', 'play songs', 'suggest track', 'find songs', 'get songs', 
+      'songs based on', 'mode description', 'gaane bajao', 'gana bajao', 'gaane sunao', 
+      'music lagao', 'baja do', 'bajao', 'gaane lagao', 'play music', 'suggest music',
+      'curate music', 'curate mode', 'curate mood'
+    ];
+
+    const matchesCuration = curateKeywords.some(w => lowerText.includes(w)) ||
+                            (lowerText.includes('curate') && (lowerText.includes('mood') || lowerText.includes('mode'))) ||
+                            (lowerText.includes('suggest') && (lowerText.includes('song') || lowerText.includes('music') || lowerText.includes('track') || lowerText.includes('playlist'))) ||
+                            (lowerText.includes('let\'s') && lowerText.includes('curate')) ||
+                            (lowerText.includes('lets') && lowerText.includes('curate'));
+
+    if (matchesCuration) {
+      const moodInput = document.getElementById('mood-input');
+      const moodText = moodInput ? moodInput.value.trim() : '';
+      if (!moodText) {
+        // Empty validation: Ask and transition to listening_mood
+        tarangSpeaking = true;
+        if (TarangVoiceEngine.recognition) { try { TarangVoiceEngine.recognition.abort(); } catch(e) {} }
+        duckMusic();
+        
+        setTarangState('greeting');
+        console.log('Mood input empty. Asking user to describe mood.');
+        tarangSpeak("Tell me your mood first", 'en').then(() => {
+          tarangSpeaking = false;
+          tarangMoodBuffer = '';
+          if (moodInput) moodInput.value = '';
+          const transcriptEl = document.getElementById('tarang-transcript');
+          if (transcriptEl) transcriptEl.textContent = 'Describe your mood...';
+          
+          console.log('Listening for mood description...');
+          tarangState = 'listening_mood';
+          setTarangState('listening_mood');
+          
+          if (useBackendTranscription) {
+            isCommandMode = false;
+            startRecording();
+          } else {
+            TarangVoiceEngine.startRecognitionInstance();
+          }
+        });
+      } else {
+        triggerCurationFromVoice();
+      }
+      return;
+    }
+
+    // Play specific song
+    const playSpecificMatch = text.match(/^(?:play|baja|laga|sun|sunao|chalao)\s+(.+)$/i);
+    if (playSpecificMatch && playSpecificMatch[1] && playSpecificMatch[1].length > 2) {
+      const songName = playSpecificMatch[1].trim();
+      if (!['music', 'songs', 'song', 'something', 'random', 'shuffle', 'curate', 'my mood'].includes(songName)) {
+        tarangPlaySpecificSong(songName);
+        return;
+      }
+    }
+
+    // Sleep / Turn off
+    const offWords = ['goodbye tarang', 'bye tarang', 'stop listening', 'sleep', 'go to sleep', 'so jao', 'bye', 'goodbye'];
+    if (offWords.some(w => text.includes(w))) {
+      tarangRespondAndListen('Goodbye! Wake me up anytime.', 'en').then(() => {
+        tarangWake = false;
+        TarangVoiceEngine.transitionTo('passive');
+      });
+      return;
+    }
+
+    // Unknown command: return to passive
+    console.log(`Unknown command: "${text}". Returning to passive mode.`);
+  } catch (err) {
+    console.error("Error executing spoken command:", err);
+  } finally {
+    transitionToState('passive');
+    if (typeof TarangVoiceEngine !== 'undefined') {
+      TarangVoiceEngine.forceRestartRecognition();
+    }
+  }
 }
 
 // 8. PLAY SPECIFIC SONG BY NAME
@@ -2412,6 +2565,120 @@ function tarangSpeak(text, langCode) {
     speechSynthesis.speak(utter);
   });
 }
+
+// === AudioMixer Utility for Volume Ducking and TTS Transitions ===
+const AudioMixer = {
+  fadeAnimationId: null,
+
+  fadeVolume(targetVolume, durationMs) {
+    return new Promise((resolve) => {
+      if (!ytPlayer || typeof ytPlayer.getVolume !== 'function' || typeof ytPlayer.setVolume !== 'function') {
+        resolve();
+        return;
+      }
+
+      if (this.fadeAnimationId) {
+        cancelAnimationFrame(this.fadeAnimationId);
+        this.fadeAnimationId = null;
+      }
+
+      const startVolume = ytPlayer.getVolume();
+      const volumeDiff = targetVolume - startVolume;
+      const startTime = performance.now();
+
+      const step = (timestamp) => {
+        const elapsed = timestamp - startTime;
+        const progress = Math.min(elapsed / durationMs, 1);
+        const currentVolume = startVolume + (volumeDiff * progress);
+        
+        try {
+          ytPlayer.setVolume(Math.round(currentVolume));
+        } catch (e) {
+          console.error("[AudioMixer] Failed to set volume:", e);
+        }
+
+        if (progress < 1) {
+          this.fadeAnimationId = requestAnimationFrame(step);
+        } else {
+          this.fadeAnimationId = null;
+          resolve();
+        }
+      };
+
+      this.fadeAnimationId = requestAnimationFrame(step);
+    });
+  },
+
+  async playDJTransition(text) {
+    // Duck YouTube player volume to 10% over 1s
+    await this.fadeVolume(10, 1000);
+
+    // Set speaking flags to block microphone wake-word activation during TTS
+    tarangSpeaking = true;
+    if (typeof TarangVoiceEngine !== 'undefined') {
+      TarangVoiceEngine.tarangSpeaking = true;
+    }
+
+    return new Promise((resolve) => {
+      if (typeof SpeechSynthesisUtterance === 'undefined' || typeof speechSynthesis === 'undefined') {
+        tarangSpeaking = false;
+        if (typeof TarangVoiceEngine !== 'undefined') {
+          TarangVoiceEngine.tarangSpeaking = false;
+        }
+        this.fadeVolume(100, 1500).then(resolve);
+        return;
+      }
+
+      // Cancel any ongoing speaking before starting
+      speechSynthesis.cancel();
+
+      const utterance = new SpeechSynthesisUtterance(text);
+      
+      // Voice Selection Logic
+      const voices = speechSynthesis.getVoices();
+      let selectedVoice = null;
+      
+      const preferredNames = ["Google UK English Female", "Google हिन्दी", "Google US English"];
+      for (const name of preferredNames) {
+        selectedVoice = voices.find(v => v.name === name);
+        if (selectedVoice) break;
+      }
+      
+      if (!selectedVoice) {
+        selectedVoice = voices[0] || null;
+      }
+      
+      if (selectedVoice) {
+        utterance.voice = selectedVoice;
+      }
+
+      // Smooth, warm radio tone settings
+      utterance.pitch = 1.1;
+      utterance.rate = 0.95;
+
+      const finishTransition = async () => {
+        tarangSpeaking = false;
+        if (typeof TarangVoiceEngine !== 'undefined') {
+          TarangVoiceEngine.tarangSpeaking = false;
+        }
+        // Ramp music volume back to 100% over 1.5s
+        await this.fadeVolume(100, 1500);
+        resolve();
+      };
+
+      utterance.onend = () => {
+        finishTransition();
+      };
+
+      utterance.onerror = (e) => {
+        console.error("[AudioMixer] DJ transition speech error:", e);
+        finishTransition();
+      };
+
+      speechSynthesis.speak(utterance);
+    });
+  }
+};
 
 // 11. STOP THE ASSISTANT COMPLETELY
 function tarangStop() {
