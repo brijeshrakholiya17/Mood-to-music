@@ -28,12 +28,18 @@ class KeyedGemini(Gemini):
     def _live_api_client(self) -> Client:
         return Client(api_key=self.api_key)
 
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
+# Global thread executor to submit coroutines concurrently without spawning new pools
+global_executor = ThreadPoolExecutor(max_workers=10)
+
 def _run_async_in_thread(coro):
-    from concurrent.futures import ThreadPoolExecutor
-    import asyncio
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(asyncio.run, coro)
-        return future.result()
+    future = global_executor.submit(asyncio.run, coro)
+    return future.result()
+
+# Global stateful session service to persist session memory across requests
+global_session_service = InMemorySessionService()
 
 # ── Agent 1: EmotionAgent ──────────────────────────────────────────────────
 # Takes raw mood text → returns structured emotion tags + intensity
@@ -139,10 +145,7 @@ def create_music_agent(api_key: str, model_name: str) -> Agent:
 
 
 def _run_pipeline_with_model(vibe: str, excluded_songs: list, api_key: str, model_name: str) -> list:
-    # Session Creation & User Isolation:
-    # We instantiate InMemorySessionService to create isolated, stateful sessions for each request.
-    # This guarantees that individual user states/conversation flows do not interfere with each other.
-    session_service = InMemorySessionService()
+    session_service = global_session_service
     
     # The Transition from Orchestrator -> EmotionAgent:
     # Orchestrator coordinates the pipeline flow. It spawns the EmotionAgent, which takes
@@ -268,16 +271,18 @@ def run_tarang_agent_pipeline(vibe: str, excluded_songs: list, api_key: str) -> 
     Runs the full Tarang multi-agent pipeline:
     vibe text → EmotionAgent → MusicAgent → song list
     """
-    # Order models by reliability/quota limits. Lite has higher free-tier limits.
     models_to_try = [
-        "gemini-2.5-flash-lite",
         "gemini-2.5-flash",
         "gemini-2.0-flash",
         "gemini-1.5-flash"
     ]
     
+    import time
     last_err = None
-    for model_name in models_to_try:
+    for idx, model_name in enumerate(models_to_try):
+        if idx > 0:
+            print("[OrchestratorAgent] Rate limit delay: sleeping 2 seconds before retry...")
+            time.sleep(2)
         try:
             print(f"[OrchestratorAgent] Attempting ADK pipeline with model: {model_name}")
             return _run_pipeline_with_model(vibe, excluded_songs, api_key, model_name)

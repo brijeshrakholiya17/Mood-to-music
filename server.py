@@ -2,6 +2,7 @@
 import os
 import urllib.request
 import urllib.parse
+import urllib.error
 import re
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -49,12 +50,13 @@ app = Flask(__name__, static_folder='.')
 
 # Kaggle Capstone: Security Implementation — CORS origins configuration
 # Restricts incoming API requests to trusted frontend domains only.
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000").rstrip("/")
+
 ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://mood-to-music.onrender.com",
-    "https://mood-to-music.onrender.com/",
-    os.environ.get("FRONTEND_URL", "")    # set this env var in production
+    FRONTEND_URL
 ]
 
 CORS(app, resources={
@@ -88,6 +90,35 @@ def sanitize_text_input(text, max_length=500, field_name="input"):
     # Remove null bytes
     text = text.replace('\x00', '')
     return text, None
+
+def validate_excluded_songs(raw_list):
+    """
+    Validates and cleans the excludedSongs input list defensively.
+    Returns (cleaned_list, error_message).
+    """
+    if raw_list is None:
+        return [], None
+    if not isinstance(raw_list, list):
+        return None, "excludedSongs must be a list"
+    
+    if len(raw_list) > 100:
+        return None, "excludedSongs exceeds maximum allowed length of 100 items"
+        
+    cleaned = []
+    for idx, item in enumerate(raw_list):
+        if not isinstance(item, str):
+            return None, f"excludedSongs item at index {idx} must be a string"
+        
+        cleaned_item = item.strip()
+        if not cleaned_item:
+            continue
+            
+        if len(cleaned_item) > 200:
+            return None, f"excludedSongs item at index {idx} exceeds maximum allowed length of 200 characters"
+            
+        cleaned.append(cleaned_item)
+        
+    return cleaned, None
 
 limiter = Limiter(
     get_remote_address,
@@ -156,7 +187,6 @@ def check_playability(video_id):
         }
     except Exception as e:
         print(f"Error checking playability for video {video_id}: {e}")
-        import urllib.error
         is_fallback = False
         reason_str = str(e)
         if isinstance(e, urllib.error.HTTPError):
@@ -175,9 +205,24 @@ def check_playability(video_id):
 def index():
     return send_from_directory('.', 'index.html')
 
+ALLOWED_STATIC_FILES = {
+    'index.html',
+    'app.js',
+    'style.css',
+    'logo.png',
+    'favicon.ico'
+}
+
 @app.route('/<path:path>')
 def static_files(path):
-    return send_from_directory('.', path)
+    # Normalize the path and replace backslashes for consistency
+    clean_path = os.path.normpath(path).replace('\\', '/')
+    
+    # Restrict serving dotfiles, .env, .py files, and any file not in the allowlist
+    if clean_path not in ALLOWED_STATIC_FILES:
+        return "Not Found", 404
+        
+    return send_from_directory('.', clean_path)
 
 def search_and_verify(query):
     """
@@ -248,7 +293,7 @@ def search_and_verify(query):
         # This prevents complete curation failure on hosted platforms like Render.
         if video_ids:
             print(f"[Search] Playability verification failed for all candidates. Falling back to first candidate: {video_ids[0]}")
-            return video_ids[0], candidates_log, "OK"
+            return video_ids[0], candidates_log, "OK_UNVERIFIED_FALLBACK"
             
         return None, candidates_log, "UNPLAYABLE"
         
@@ -272,6 +317,16 @@ def api_search():
         return jsonify({
             'videoId': vid,
             'status': 'OK',
+            'verified': True,
+            'candidates': candidates_log
+        })
+        
+    if status == "OK_UNVERIFIED_FALLBACK":
+        print(f"Resolved unverified fallback video ID for primary query: {vid}")
+        return jsonify({
+            'videoId': vid,
+            'status': 'OK_UNVERIFIED_FALLBACK',
+            'verified': False,
             'candidates': candidates_log
         })
         
@@ -291,7 +346,17 @@ def api_search():
         print(f"Resolved working video ID for lyric fallback query: {fb_vid}")
         return jsonify({
             'videoId': fb_vid,
-            'status': 'OK_FALLBACK',
+            'status': 'OK',
+            'verified': True,
+            'candidates': combined_candidates
+        })
+        
+    if fb_status == "OK_UNVERIFIED_FALLBACK":
+        print(f"Resolved unverified fallback video ID for lyric fallback query: {fb_vid}")
+        return jsonify({
+            'videoId': fb_vid,
+            'status': 'OK_UNVERIFIED_FALLBACK',
+            'verified': False,
             'candidates': combined_candidates
         })
         
@@ -311,7 +376,17 @@ def api_search():
         print(f"Resolved working video ID for audio fallback query: {sec_vid}")
         return jsonify({
             'videoId': sec_vid,
-            'status': 'OK_FALLBACK',
+            'status': 'OK',
+            'verified': True,
+            'candidates': combined_candidates
+        })
+        
+    if sec_status == "OK_UNVERIFIED_FALLBACK":
+        print(f"Resolved unverified fallback video ID for audio fallback query: {sec_vid}")
+        return jsonify({
+            'videoId': sec_vid,
+            'status': 'OK_UNVERIFIED_FALLBACK',
+            'verified': False,
             'candidates': combined_candidates
         })
         
@@ -320,6 +395,7 @@ def api_search():
     return jsonify({
         'videoId': None,
         'status': 'UNPLAYABLE',
+        'verified': False,
         'error': 'All candidates in primary and fallback searches failed playability verification',
         'candidates': combined_candidates
     })
@@ -330,15 +406,17 @@ def execute_gemini_multimodal_request(payload, api_key):
     if any candidates fail with a 404/400 (unsupported model/endpoint) error.
     """
     models_to_try = [
-        {"name": "gemini-2.0-flash", "version": "v1beta"},
         {"name": "gemini-2.5-flash", "version": "v1beta"},
-        {"name": "gemini-2.5-flash-lite", "version": "v1beta"},
-        {"name": "gemini-2.5-pro", "version": "v1beta"},
-        {"name": "gemini-flash-latest", "version": "v1beta"},
+        {"name": "gemini-2.0-flash", "version": "v1beta"},
+        {"name": "gemini-1.5-flash", "version": "v1beta"},
     ]
     
+    import time
     errors = []
-    for model in models_to_try:
+    for idx, model in enumerate(models_to_try):
+        if idx > 0:
+            print("Gemini request delay: sleeping 2 seconds before retry...")
+            time.sleep(2)
         url = f"https://generativelanguage.googleapis.com/{model['version']}/models/{model['name']}:generateContent?key={api_key}"
         print(f"Attempting Gemini request on model fallback: {model['name']} ({model['version']})")
         req_data = json.dumps(payload).encode('utf-8')
@@ -417,14 +495,15 @@ JSON array:"""
     models_to_try = [
         {"name": "gemini-2.5-flash", "version": "v1beta"},
         {"name": "gemini-2.0-flash", "version": "v1beta"},
-        {"name": "gemini-2.5-flash-lite", "version": "v1beta"},
-        {"name": "gemini-1.5-flash", "version": "v1"},
         {"name": "gemini-1.5-flash", "version": "v1beta"},
-        {"name": "gemini-pro", "version": "v1beta"}
     ]
     
+    import time
     errors = []
-    for m in models_to_try:
+    for idx, m in enumerate(models_to_try):
+        if idx > 0:
+            print("Backend curation retry delay: sleeping 2 seconds before retry...")
+            time.sleep(2)
         try:
             print(f"Attempting backend curation with: {m['name']} ({m['version']})")
             text_res = execute_gemini_text_request(prompt, m["name"], m["version"], api_key)
@@ -441,7 +520,7 @@ JSON array:"""
     raise Exception(f"All Gemini models failed to curate playlist. Details: {'; '.join(errors)}")
 
 def get_clean_api_key():
-    api_key = request.headers.get('X-Gemini-API-Key') or os.environ.get('GEMINI_API_KEY')
+    api_key = os.environ.get('GEMINI_API_KEY')
     if api_key:
         api_key = api_key.strip().strip('"').strip("'")
         if not api_key or any(p in api_key.lower() for p in ["your_gemini_api_key_here", "your_actual_api_key_here", "gemini_api_key", "your-gemini-api-key"]):
@@ -456,6 +535,7 @@ def api_status():
     })
 
 @app.route('/api/curate', methods=['POST'])
+@limiter.limit("10 per minute")
 def api_curate():
     """
     Kaggle Capstone Curation Endpoint with Fallback Architecture.
@@ -474,7 +554,11 @@ def api_curate():
     vibe, vibe_err = sanitize_text_input(vibe_raw, max_length=500, field_name="vibe")
     if vibe_err:
         return jsonify({'error': vibe_err}), 400
-    excluded_songs = data.get('excludedSongs', [])
+        
+    excluded_songs_raw = data.get('excludedSongs')
+    excluded_songs, excluded_err = validate_excluded_songs(excluded_songs_raw)
+    if excluded_err:
+        return jsonify({'error': excluded_err}), 400
         
     try:
         # Try ADK multi-agent pipeline first, fall back to legacy
@@ -496,68 +580,76 @@ def api_curate():
         return jsonify({'songs': songs, 'pipeline': 'legacy'})
     except Exception as e:
         print(f"Curation failed: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({'error': "Internal Server Error"}), 500
 
 @app.route('/api/voice-curate', methods=['POST'])
+@limiter.limit("6 per minute")
 def api_voice_curate():
-    api_key = get_clean_api_key()
-    if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
-
-    data = request.json or {}
-    audio_base64 = data.get('audio', '')
-    mime_type = data.get('mimeType', 'audio/webm')
-    
-    if not audio_base64:
-        return jsonify({'error': 'Audio data is required'}), 400
-        
-    if len(audio_base64) > 10 * 1024 * 1024:
-        return jsonify({'error': 'Audio payload exceeds maximum size limit (10MB)'}), 400
-        
-    print(f"=== Multimodal Voice Curation Request ({mime_type}) ===")
-    
-    prompt = """You are 'Tarang', a professional conversational Indian voice assistant and music curator.
-    1. Listen to the audio clip and transcribe the user's spoken words.
-    2. Auto-detect if the user is speaking in English, Hindi, Gujarati, or code-mixed Indian languages (e.g. Hinglish/Gujlish).
-    3. Identify the user's mood, feelings, or situation from their spoken description.
-    4. Curate exactly 20 real Hindi/Bollywood songs matching this mood/vibe.
-    5. Output a conversational voice response spoken back in the same language detected (English, Hindi, or Gujarati). Keep it to 1-2 short, natural sentences (e.g., 'मैने आपके मूड के लिए 20 सुंदर गाने तैयार किये हैं। चलिए प्ले करते हैं।' or 'મેં તમારા મૂડ માટે 20 સરસ ગીતો ક્યુરેટ કર્યા છે. ચાલો સાંભળીએ.').
-    
-    IMPORTANT CONSTRAINT: The song recommendations MUST be strictly in the Hindi language (e.g. from Bollywood, Hindi indie, or Hindi classical/pop). Do not recommend songs in English under any circumstances.
-    
-    You must output ONLY a valid JSON object matching the following structure (do not wrap in markdown or backticks):
-    {
-      "detectedMood": "A short English phrase representing the mood",
-      "detectedLanguage": "en | hi | gu",
-      "voiceResponse": "Friendly spoken confirmation text in the user's language",
-      "songs": [
-        {
-          "title": "Song Title",
-          "artist": "Artist Name",
-          "explanation": "Poetic 1-sentence explanation in English of why it matches"
-        }
-      ]
-    }
-    """
-    
-    # Construct the JSON payload with inlineData audio bytes
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": audio_base64
-                    }
-                },
-                {
-                    "text": prompt
-                }
-            ]
-        }]
-    }
-    
     try:
+        api_key = get_clean_api_key()
+        if not api_key:
+            return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
+
+        data = request.json or {}
+        
+        # Run the same validation on excludedSongs if present
+        excluded_songs_raw = data.get('excludedSongs')
+        _, excluded_err = validate_excluded_songs(excluded_songs_raw)
+        if excluded_err:
+            return jsonify({'error': excluded_err}), 400
+
+        audio_base64 = data.get('audio', '')
+        mime_type = data.get('mimeType', 'audio/webm')
+        
+        if not audio_base64:
+            return jsonify({'error': 'Audio data is required'}), 400
+            
+        if len(audio_base64) > 10 * 1024 * 1024:
+            return jsonify({'error': 'Audio payload exceeds maximum size limit (10MB)'}), 400
+            
+        print(f"=== Multimodal Voice Curation Request ({mime_type}) ===")
+        
+        prompt = """You are 'Tarang', a professional conversational Indian voice assistant and music curator.
+        1. Listen to the audio clip and transcribe the user's spoken words.
+        2. Auto-detect if the user is speaking in English, Hindi, Gujarati, or code-mixed Indian languages (e.g. Hinglish/Gujlish).
+        3. Identify the user's mood, feelings, or situation from their spoken description.
+        4. Curate exactly 20 real Hindi/Bollywood songs matching this mood/vibe.
+        5. Output a conversational voice response spoken back in the same language detected (English, Hindi, or Gujarati). Keep it to 1-2 short, natural sentences (e.g., 'मैने आपके मूड के लिए 20 सुंदर गाने तैयार किये हैं। चलिए प्ले करते हैं।' or 'મેં તમારા મૂડ માટે 20 સરસ ગીતો ક્યુરેટ કર્યા છે. ચાલો સાંભળીએ.').
+        
+        IMPORTANT CONSTRAINT: The song recommendations MUST be strictly in the Hindi language (e.g. from Bollywood, Hindi indie, or Hindi classical/pop). Do not recommend songs in English under any circumstances.
+        
+        You must output ONLY a valid JSON object matching the following structure (do not wrap in markdown or backticks):
+        {
+          "detectedMood": "A short English phrase representing the mood",
+          "detectedLanguage": "en | hi | gu",
+          "voiceResponse": "Friendly spoken confirmation text in the user's language",
+          "songs": [
+            {
+              "title": "Song Title",
+              "artist": "Artist Name",
+              "explanation": "Poetic 1-sentence explanation in English of why it matches"
+            }
+          ]
+        }
+        """
+        
+        # Construct the JSON payload with inlineData audio bytes
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": audio_base64
+                        }
+                    },
+                    {
+                        "text": prompt
+                    }
+                ]
+            }]
+        }
+        
         text = execute_gemini_multimodal_request(payload, api_key)
         clean_text = text.replace("```json", "").replace("```", "").strip()
         parsed_response = json.loads(clean_text)
@@ -570,46 +662,47 @@ def api_voice_curate():
         
     except Exception as e:
         print(f"Error calling Gemini audio curation API: {e}")
-        return jsonify({'error': f"Gemini Multimodal Audio processing failed: {str(e)}"}), 500
+        return jsonify({'error': "Internal Server Error"}), 500
 
 @app.route('/api/transcribe', methods=['POST'])
+@limiter.limit("20 per minute")
 def api_transcribe():
-    api_key = get_clean_api_key()
-    if not api_key:
-        return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
-
-    data = request.json or {}
-    audio_base64 = data.get('audio', '')
-    mime_type = data.get('mimeType', 'audio/webm')
-    
-    if not audio_base64:
-        return jsonify({'error': 'Audio data is required'}), 400
-        
-    if len(audio_base64) > 10 * 1024 * 1024:
-        return jsonify({'error': 'Audio payload exceeds maximum size limit (10MB)'}), 400
-        
-    print(f"=== Multimodal Voice Transcription Request ({mime_type}) ===")
-    
-    # Ultra-fast plain-text transcription prompt
-    prompt = "Transcribe the user's spoken words in this audio recording. Return ONLY the plain transcription text with no markdown, explanation, or extra characters."
-    
-    payload = {
-        "contents": [{
-            "parts": [
-                {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": audio_base64
-                    }
-                },
-                {
-                    "text": prompt
-                }
-            ]
-        }]
-    }
-    
     try:
+        api_key = get_clean_api_key()
+        if not api_key:
+            return jsonify({'error': 'Gemini API key is not configured or is a placeholder.'}), 400
+
+        data = request.json or {}
+        audio_base64 = data.get('audio', '')
+        mime_type = data.get('mimeType', 'audio/webm')
+        
+        if not audio_base64:
+            return jsonify({'error': 'Audio data is required'}), 400
+            
+        if len(audio_base64) > 10 * 1024 * 1024:
+            return jsonify({'error': 'Audio payload exceeds maximum size limit (10MB)'}), 400
+            
+        print(f"=== Multimodal Voice Transcription Request ({mime_type}) ===")
+        
+        # Ultra-fast plain-text transcription prompt
+        prompt = "Transcribe the user's spoken words in this audio recording. Return ONLY the plain transcription text with no markdown, explanation, or extra characters."
+        
+        payload = {
+            "contents": [{
+                "parts": [
+                    {
+                        "inlineData": {
+                            "mimeType": mime_type,
+                            "data": audio_base64
+                        }
+                    },
+                    {
+                        "text": prompt
+                    }
+                ]
+            }]
+        }
+        
         text = execute_gemini_multimodal_request(payload, api_key)
         transcribed_text = text.strip()
         
@@ -630,7 +723,7 @@ def api_transcribe():
         
     except Exception as e:
         print(f"Error calling Gemini transcription API: {e}")
-        return jsonify({'error': f"Transcription failed: {str(e)}"}), 500
+        return jsonify({'error': "Internal Server Error"}), 500
 
 if __name__ == '__main__':
     # Disable file caching for static files during development
