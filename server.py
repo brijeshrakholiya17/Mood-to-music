@@ -560,12 +560,14 @@ def api_curate():
     if excluded_err:
         return jsonify({'error': excluded_err}), 400
         
+    language = data.get('language', 'Hindi')
+        
     try:
         # Try ADK multi-agent pipeline first, fall back to legacy
         if ADK_AVAILABLE:
-            print("[OrchestratorAgent] Using ADK multi-agent pipeline")
+            print(f"[OrchestratorAgent] Using ADK multi-agent pipeline for language: {language}")
             try:
-                songs, emotion_data = run_tarang_agent_pipeline(vibe, excluded_songs, api_key)
+                songs, emotion_data = run_tarang_agent_pipeline(vibe, excluded_songs, api_key, language)
                 return jsonify({
                     'songs': songs,
                     'emotion_analysis': emotion_data,  # bonus: send emotion data to frontend
